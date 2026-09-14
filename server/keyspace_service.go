@@ -204,3 +204,27 @@ func (s *KeyspaceServer) GetAllKeyspaces(_ context.Context, request *keyspacepb.
 		Keyspaces: keyspaces,
 	}, nil
 }
+
+// SelectKeyspaceEncryptionMetaFile atomically selects one CSE-generated CMEK
+// metadata file for a pending reused-keyspace create reset.
+func (s *KeyspaceServer) SelectKeyspaceEncryptionMetaFile(
+	_ context.Context,
+	request *keyspacepb.SelectKeyspaceEncryptionMetaFileRequest,
+) (*keyspacepb.SelectKeyspaceEncryptionMetaFileResponse, error) {
+	if err := s.validateRequest(request.GetHeader()); err != nil {
+		return nil, err
+	}
+	selected, err := s.GetKeyspaceManager().SelectKeyspaceEncryptionMetaFile(
+		request.GetKeyspaceId(),
+		request.GetGeneration(),
+		request.GetRestoreVersion(),
+		request.GetCandidateFileId(),
+	)
+	if err != nil {
+		return &keyspacepb.SelectKeyspaceEncryptionMetaFileResponse{Header: getErrorHeader(err)}, nil
+	}
+	return &keyspacepb.SelectKeyspaceEncryptionMetaFileResponse{
+		Header:         grpcutil.WrapHeader(),
+		SelectedFileId: selected,
+	}, nil
+}

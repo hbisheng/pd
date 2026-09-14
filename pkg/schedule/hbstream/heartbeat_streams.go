@@ -47,6 +47,8 @@ type Operation struct {
 	SwitchWitnesses *pdpb.BatchSwitchWitness
 	// PD requires preventing the auto-splitting of this region.
 	ChangeSplit *pdpb.ChangeSplit
+	// KeyspaceReset is a downstream, heartbeat-driven empty restore command.
+	KeyspaceReset *pdpb.KeyspaceReset
 }
 
 // HeartbeatStream is an interface.
@@ -257,6 +259,7 @@ func (s *HeartbeatStreams) SendMsg(region *core.RegionInfo, op *Operation) {
 			ChangePeerV2:    op.ChangePeerV2,
 			SwitchWitnesses: op.SwitchWitnesses,
 			ChangeSplit:     op.ChangeSplit,
+			KeyspaceReset:   op.KeyspaceReset,
 		}
 	default:
 		resp = &pdpb.RegionHeartbeatResponse{
@@ -271,6 +274,7 @@ func (s *HeartbeatStreams) SendMsg(region *core.RegionInfo, op *Operation) {
 			ChangePeerV2:    op.ChangePeerV2,
 			SwitchWitnesses: op.SwitchWitnesses,
 			ChangeSplit:     op.ChangeSplit,
+			KeyspaceReset:   op.KeyspaceReset,
 		}
 	}
 
