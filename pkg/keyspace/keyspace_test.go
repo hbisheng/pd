@@ -68,6 +68,9 @@ type mockConfig struct {
 	WaitRegionSplit          bool
 	WaitRegionSplitTimeout   typeutil.Duration
 	CheckRegionSplitInterval typeutil.Duration
+	EnableIDReuse            bool
+	IDReuseThreshold         uint64
+	IDReuseWorkerInterval    typeutil.Duration
 	// MetaServiceGroups is used to mock the meta-service groups for keyspace assignment.
 	MetaServiceGroups map[string]string
 }
@@ -86,6 +89,21 @@ func (m *mockConfig) GetWaitRegionSplitTimeout() time.Duration {
 
 func (m *mockConfig) GetCheckRegionSplitInterval() time.Duration {
 	return m.CheckRegionSplitInterval.Duration
+}
+
+func (m *mockConfig) IsIDReuseEnabled() bool {
+	return m.EnableIDReuse
+}
+
+func (m *mockConfig) GetIDReuseThreshold() uint64 {
+	return m.IDReuseThreshold
+}
+
+func (m *mockConfig) GetIDReuseWorkerInterval() time.Duration {
+	if m.IDReuseWorkerInterval.Duration == 0 {
+		return time.Second
+	}
+	return m.IDReuseWorkerInterval.Duration
 }
 
 func (m *mockConfig) SetMetaServiceGroups(metaServiceGroups map[string]string) {
@@ -1200,9 +1218,10 @@ func (suite *keyspaceTestSuite) TestTombstoneKeyspaceUnassignsMetaServiceGroup()
 	re.NoError(err)
 	re.Equal(0, counts[groupID])
 
-	// Reclamation is rejected until the tombstone quarantine elapses. The group
-	// binding was already cleared, so the failed attempt cannot decrement again.
-	re.Error(manager.store.RunInTxn(suite.ctx, func(txn kv.Txn) error {
+	// Removing the already-tombstoned keyspace must not decrement the counter
+	// again: the group binding was cleared and persisted during the tombstone
+	// transition, so unassignment is a no-op and the count stays at zero.
+	re.NoError(manager.store.RunInTxn(suite.ctx, func(txn kv.Txn) error {
 		return manager.RemoveKeyspace(txn, updated.GetId())
 	}))
 	counts, err = manager.mgm.GetAssignmentCounts(suite.ctx)

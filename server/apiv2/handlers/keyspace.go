@@ -46,6 +46,28 @@ func RegisterKeyspace(r *gin.RouterGroup) {
 	router.PATCH("/:name/config", UpdateKeyspaceConfig)
 	router.PUT("/:name/state", UpdateKeyspaceState)
 	router.GET("/id/:id", LoadKeyspaceByID)
+	router.POST("/id/:id/reclaim", ReclaimKeyspace)
+}
+
+// ReclaimKeyspace accepts an explicit Cleaner request to start durable ID
+// reclamation after ordinary cleanup and tombstone retention have completed.
+func ReclaimKeyspace(c *gin.Context) {
+	svr := c.MustGet(middlewares.ServerContextKey).(*server.Server)
+	manager := svr.GetKeyspaceManager()
+	if manager == nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, managerUninitializedErr)
+		return
+	}
+	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := manager.RequestKeyspaceReclaim(uint32(id)); err != nil {
+		c.AbortWithStatusJSON(http.StatusConflict, err.Error())
+		return
+	}
+	c.Status(http.StatusAccepted)
 }
 
 // CreateKeyspaceParams represents parameters needed when creating a new keyspace.
@@ -461,6 +483,8 @@ func (meta *KeyspaceMeta) MarshalJSON() ([]byte, error) {
 		CreatedAt      int64             `json:"created_at,omitempty"`
 		StateChangedAt int64             `json:"state_changed_at,omitempty"`
 		Config         map[string]string `json:"config,omitempty"`
+		Generation     uint64            `json:"generation,omitempty"`
+		RestoreVersion uint64            `json:"restore_version,omitempty"`
 	}{
 		meta.GetId(),
 		meta.Name,
@@ -468,6 +492,8 @@ func (meta *KeyspaceMeta) MarshalJSON() ([]byte, error) {
 		meta.CreatedAt,
 		meta.StateChangedAt,
 		meta.Config,
+		meta.Generation,
+		meta.RestoreVersion,
 	})
 }
 
@@ -480,6 +506,8 @@ func (meta *KeyspaceMeta) UnmarshalJSON(data []byte) error {
 		CreatedAt      int64             `json:"created_at,omitempty"`
 		StateChangedAt int64             `json:"state_changed_at,omitempty"`
 		Config         map[string]string `json:"config,omitempty"`
+		Generation     uint64            `json:"generation,omitempty"`
+		RestoreVersion uint64            `json:"restore_version,omitempty"`
 	}{}
 
 	if err := json.Unmarshal(data, aux); err != nil {
@@ -492,6 +520,8 @@ func (meta *KeyspaceMeta) UnmarshalJSON(data []byte) error {
 		CreatedAt:      aux.CreatedAt,
 		StateChangedAt: aux.StateChangedAt,
 		Config:         aux.Config,
+		Generation:     aux.Generation,
+		RestoreVersion: aux.RestoreVersion,
 	}
 	meta.KeyspaceMeta = pbMeta
 	return nil

@@ -564,6 +564,9 @@ func (s *Server) startServer(ctx context.Context) error {
 	}
 	s.gcStateManager = gc.NewGCStateManager(s.storage.GetGCStateProvider(), s.cfg.PDServerCfg, s.keyspaceManager)
 	s.hbStreams = hbstream.NewHeartbeatStreams(ctx, "", s.cluster)
+	s.keyspaceManager.SetKeyspaceUpdateNotifier(func(region *core.RegionInfo) {
+		s.hbStreams.SendMsg(region, &hbstream.Operation{KeyspaceUpdateRequired: true})
+	})
 	// initial hot_region_storage in here.
 
 	s.hotRegionStorage, err = storage.NewHotRegionsStorage(
@@ -860,12 +863,19 @@ func (s *Server) createRaftCluster() error {
 	if s.cluster.IsRunning() {
 		return nil
 	}
-
-	return s.cluster.Start(s, false)
+	if err := s.cluster.Start(s, false); err != nil {
+		return err
+	}
+	if err := s.keyspaceManager.StartIDReuse(); err != nil {
+		s.cluster.Stop()
+		return err
+	}
+	return nil
 }
 
 func (s *Server) stopRaftCluster() {
 	failpoint.Inject("raftclusterIsBusy", func() {})
+	s.keyspaceManager.StopIDReuse()
 	s.cluster.Stop()
 }
 

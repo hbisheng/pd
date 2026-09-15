@@ -41,3 +41,8 @@ func (alloc *IDAllocator) SetBase(newBase uint64) error {
 func (*IDAllocator) Rebase() error {
 	return nil
 }
+
+// GetReservedWindowEnd returns the current mock allocation watermark.
+func (alloc *IDAllocator) GetReservedWindowEnd() uint64 {
+	return atomic.LoadUint64(&alloc.base)
+}

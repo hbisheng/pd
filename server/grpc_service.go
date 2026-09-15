@@ -978,7 +978,6 @@ func (s *GrpcServer) StoreHeartbeat(ctx context.Context, request *pdpb.StoreHear
 					err.Error()),
 			}, nil
 		}
-		s.GetKeyspaceManager().RecordKeyspaceResetStatuses(storeID, request.GetStats().GetKeyspaceResetStatuses())
 
 		s.handleDamagedStore(request.GetStats())
 		storeHeartbeatHandleDuration.WithLabelValues(storeAddress, storeLabel).Observe(time.Since(start).Seconds())
@@ -1010,6 +1009,10 @@ func (s *GrpcServer) StoreHeartbeat(ctx context.Context, request *pdpb.StoreHear
 	resp.ReplicationStatus = rc.GetReplicationMode().GetReplicationStatus()
 	resp.ClusterVersion = rc.GetClusterVersion()
 	rc.GetUnsafeRecoveryController().HandleStoreHeartbeat(request, resp)
+	stats := request.GetStats()
+	s.GetKeyspaceManager().RecordKeyspaceStateStatuses(
+		stats.GetStoreId(), stats.GetKeyspaceIdReuseCapable(), stats.GetKeyspaceStateStatuses())
+	resp.KeyspaceStateRequests = s.GetKeyspaceManager().KeyspaceStateRequests(stats.GetStoreId())
 
 	return resp, nil
 }
@@ -1426,8 +1429,8 @@ func (s *GrpcServer) RegionHeartbeat(stream pdpb.PD_RegionHeartbeatServer) error
 		}
 		regionHeartbeatHandleDuration.WithLabelValues(storeAddress, storeLabel).Observe(time.Since(start).Seconds())
 		regionHeartbeatCounter.WithLabelValues(storeAddress, storeLabel, "report", "ok").Inc()
-		if reset := s.GetKeyspaceManager().KeyspaceResetForRegion(region); reset != nil {
-			s.hbStreams.SendMsg(region, &hbstream.Operation{KeyspaceReset: reset})
+		if s.GetKeyspaceManager().KeyspaceUpdateRequiredForRegion(region.GetID()) {
+			s.hbStreams.SendMsg(region, &hbstream.Operation{KeyspaceUpdateRequired: true})
 		}
 
 		if rc.IsServiceIndependent(constant.SchedulingServiceName) {

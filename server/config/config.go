@@ -250,6 +250,8 @@ const (
 	defaultCheckRegionSplitInterval = 50 * time.Millisecond
 	minCheckRegionSplitInterval     = 1 * time.Millisecond
 	maxCheckRegionSplitInterval     = 100 * time.Millisecond
+	defaultKeyspaceIDReuseThreshold = uint64(1_000_000)
+	defaultKeyspaceIDReuseInterval  = time.Second
 
 	defaultEnableSchedulingFallback      = true
 	defaultEnableTSODynamicSwitching     = false
@@ -881,6 +883,13 @@ type KeyspaceConfig struct {
 	WaitRegionSplitTimeout typeutil.Duration `toml:"wait-region-split-timeout" json:"wait-region-split-timeout"`
 	// CheckRegionSplitInterval indicates the interval to check whether the region split is complete
 	CheckRegionSplitInterval typeutil.Duration `toml:"check-region-split-interval" json:"check-region-split-interval"`
+	// EnableIDReuse enables the experimental deleted-keyspace ID reuse path.
+	EnableIDReuse bool `toml:"enable-id-reuse" json:"enable-id-reuse"`
+	// IDReuseThreshold is the minimum reserved allocator-window end at which
+	// new reclamation requests are admitted.
+	IDReuseThreshold uint64 `toml:"id-reuse-threshold" json:"id-reuse-threshold"`
+	// IDReuseWorkerInterval bounds durable task notification and advancement.
+	IDReuseWorkerInterval typeutil.Duration `toml:"id-reuse-worker-interval" json:"id-reuse-worker-interval"`
 	// MetaServiceGroups is the available external meta-service groups.
 	// The key is the meta-service group name, and the value is the corresponding endpoint.
 	MetaServiceGroups map[string]string `toml:"meta-service-groups" json:"meta-service-groups"`
@@ -895,6 +904,9 @@ func (c *KeyspaceConfig) Validate() error {
 	if c.CheckRegionSplitInterval.Duration >= c.WaitRegionSplitTimeout.Duration {
 		return errors.New("[keyspace] check-region-split-interval should be less than wait-region-split-timeout")
 	}
+	if c.IDReuseWorkerInterval.Duration <= 0 {
+		return errors.New("[keyspace] id-reuse-worker-interval must be positive")
+	}
 	return nil
 }
 
@@ -907,6 +919,12 @@ func (c *KeyspaceConfig) adjust(meta *configutil.ConfigMetaData) error {
 	}
 	if !meta.IsDefined("check-region-split-interval") {
 		c.CheckRegionSplitInterval = typeutil.NewDuration(defaultCheckRegionSplitInterval)
+	}
+	if !meta.IsDefined("id-reuse-threshold") {
+		c.IDReuseThreshold = defaultKeyspaceIDReuseThreshold
+	}
+	if !meta.IsDefined("id-reuse-worker-interval") {
+		c.IDReuseWorkerInterval = typeutil.NewDuration(defaultKeyspaceIDReuseInterval)
 	}
 
 	return AdjustMetaServiceGroups(c.MetaServiceGroups)
@@ -984,6 +1002,21 @@ func (c *KeyspaceConfig) GetWaitRegionSplitTimeout() time.Duration {
 // GetCheckRegionSplitInterval returns the interval to check whether the region split is complete.
 func (c *KeyspaceConfig) GetCheckRegionSplitInterval() time.Duration {
 	return c.CheckRegionSplitInterval.Duration
+}
+
+// IsIDReuseEnabled reports whether deleted-keyspace ID reuse is enabled.
+func (c *KeyspaceConfig) IsIDReuseEnabled() bool {
+	return c.EnableIDReuse
+}
+
+// GetIDReuseThreshold returns the allocator reserved-window admission threshold.
+func (c *KeyspaceConfig) GetIDReuseThreshold() uint64 {
+	return c.IDReuseThreshold
+}
+
+// GetIDReuseWorkerInterval returns the durable task worker interval.
+func (c *KeyspaceConfig) GetIDReuseWorkerInterval() time.Duration {
+	return c.IDReuseWorkerInterval.Duration
 }
 
 // GetMetaServiceGroups returns the current meta-service-group configuration.

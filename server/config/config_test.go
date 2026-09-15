@@ -47,6 +47,30 @@ func TestSecurity(t *testing.T) {
 	re.Equal(logutil.RedactInfoLogOFF, cfg.Security.RedactInfoLog)
 }
 
+func TestKeyspaceIDReuseDefaultsAndOverride(t *testing.T) {
+	re := require.New(t)
+	cfg := NewConfig()
+	meta, err := toml.Decode("", &cfg)
+	re.NoError(err)
+	re.NoError(cfg.Adjust(&meta, false))
+	re.False(cfg.Keyspace.EnableIDReuse)
+	re.Equal(uint64(1_000_000), cfg.Keyspace.IDReuseThreshold)
+	re.Equal(time.Second, cfg.Keyspace.IDReuseWorkerInterval.Duration)
+
+	cfg = NewConfig()
+	meta, err = toml.Decode(`
+[keyspace]
+enable-id-reuse = true
+id-reuse-threshold = 42
+id-reuse-worker-interval = "2s"
+`, &cfg)
+	re.NoError(err)
+	re.NoError(cfg.Adjust(&meta, false))
+	re.True(cfg.Keyspace.EnableIDReuse)
+	re.Equal(uint64(42), cfg.Keyspace.IDReuseThreshold)
+	re.Equal(2*time.Second, cfg.Keyspace.IDReuseWorkerInterval.Duration)
+}
+
 func TestTLS(t *testing.T) {
 	re := require.New(t)
 	cfg := NewConfig()
