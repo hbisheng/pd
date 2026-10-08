@@ -92,7 +92,7 @@ func (s *KeyspaceServer) LoadKeyspaceByID(_ context.Context, request *keyspacepb
 	}
 
 	manager := s.GetKeyspaceManager()
-	meta, task, err := manager.LoadKeyspaceWithTask(request.GetId())
+	meta, err := manager.LoadKeyspaceByID(request.GetId())
 	if err != nil {
 		return &keyspacepb.LoadKeyspaceResponse{Header: getErrorHeader(err)}, nil
 	}
@@ -102,7 +102,6 @@ func (s *KeyspaceServer) LoadKeyspaceByID(_ context.Context, request *keyspacepb
 	return &keyspacepb.LoadKeyspaceResponse{
 		Header:   grpcutil.WrapHeader(),
 		Keyspace: meta,
-		Task:     task,
 	}, nil
 }
 
@@ -203,29 +202,5 @@ func (s *KeyspaceServer) GetAllKeyspaces(_ context.Context, request *keyspacepb.
 	return &keyspacepb.GetAllKeyspacesResponse{
 		Header:    grpcutil.WrapHeader(),
 		Keyspaces: keyspaces,
-	}, nil
-}
-
-// SelectKeyspaceEncryptionMetaFile atomically selects one CSE-generated CMEK
-// metadata file for a pending reused-keyspace Create reset.
-func (s *KeyspaceServer) SelectKeyspaceEncryptionMetaFile(
-	_ context.Context,
-	request *keyspacepb.SelectKeyspaceEncryptionMetaFileRequest,
-) (*keyspacepb.SelectKeyspaceEncryptionMetaFileResponse, error) {
-	if err := s.validateRequest(request.GetHeader()); err != nil {
-		return nil, err
-	}
-	selected, err := s.GetKeyspaceManager().SelectKeyspaceEncryptionMetaFile(
-		request.GetKeyspaceId(),
-		request.GetGeneration(),
-		request.GetRestoreVersion(),
-		request.GetCandidateFileId(),
-	)
-	if err != nil {
-		return &keyspacepb.SelectKeyspaceEncryptionMetaFileResponse{Header: getErrorHeader(err)}, nil
-	}
-	return &keyspacepb.SelectKeyspaceEncryptionMetaFileResponse{
-		Header:         grpcutil.WrapHeader(),
-		SelectedFileId: selected,
 	}, nil
 }

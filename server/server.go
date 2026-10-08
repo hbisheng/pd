@@ -565,7 +565,7 @@ func (s *Server) startServer(ctx context.Context) error {
 	s.gcStateManager = gc.NewGCStateManager(s.storage.GetGCStateProvider(), s.cfg.PDServerCfg, s.keyspaceManager)
 	s.hbStreams = hbstream.NewHeartbeatStreams(ctx, "", s.cluster)
 	s.keyspaceManager.SetKeyspaceUpdateNotifier(func(region *core.RegionInfo) {
-		s.hbStreams.SendMsg(region, &hbstream.Operation{KeyspaceUpdateRequired: true})
+		s.hbStreams.SendMsg(region, &hbstream.Operation{RegionRequiresUpdate: true})
 	})
 	// initial hot_region_storage in here.
 

@@ -885,6 +885,10 @@ type KeyspaceConfig struct {
 	CheckRegionSplitInterval typeutil.Duration `toml:"check-region-split-interval" json:"check-region-split-interval"`
 	// EnableIDReuse enables the experimental deleted-keyspace ID reuse path.
 	EnableIDReuse bool `toml:"enable-id-reuse" json:"enable-id-reuse"`
+	// EnableEncryptedIDReuse is a follow-up POC option; production defaults to plaintext reuse.
+	EnableEncryptedIDReuse bool `toml:"enable-encrypted-id-reuse" json:"enable-encrypted-id-reuse"`
+	// IDReuseBucketBytes selects the persisted bitmap layout, immutable once installed.
+	IDReuseBucketBytes int `toml:"id-reuse-bucket-bytes" json:"id-reuse-bucket-bytes"`
 	// IDReuseThreshold is the minimum reserved allocator-window end at which
 	// new reclamation requests are admitted.
 	IDReuseThreshold uint64 `toml:"id-reuse-threshold" json:"id-reuse-threshold"`
@@ -897,6 +901,9 @@ type KeyspaceConfig struct {
 
 // Validate checks if keyspace config falls within acceptable range.
 func (c *KeyspaceConfig) Validate() error {
+	if n := c.GetIDReuseBucketBytes(); n < 1 || n > 4096 || n&(n-1) != 0 {
+		return errors.New("bitmap bucket bytes must be a power of two between 1 and 4096")
+	}
 	if c.CheckRegionSplitInterval.Duration > maxCheckRegionSplitInterval || c.CheckRegionSplitInterval.Duration < minCheckRegionSplitInterval {
 		return errors.New(fmt.Sprintf("[keyspace] check-region-split-interval should between %v and %v",
 			minCheckRegionSplitInterval, maxCheckRegionSplitInterval))
@@ -1032,3 +1039,14 @@ func (c *KeyspaceConfig) GetMetaServiceGroups() map[string]string {
 func (c *KeyspaceConfig) SetMetaServiceGroups(metaServiceGroups map[string]string) {
 	c.MetaServiceGroups = metaServiceGroups
 }
+
+// GetIDReuseBucketBytes returns the experimental bucket width.
+func (c *KeyspaceConfig) GetIDReuseBucketBytes() int {
+	if c.IDReuseBucketBytes == 0 {
+		return 32
+	}
+	return c.IDReuseBucketBytes
+}
+
+// IsEncryptedIDReuseEnabled enables the follow-up encrypted reuse path.
+func (c *KeyspaceConfig) IsEncryptedIDReuseEnabled() bool { return c.EnableEncryptedIDReuse }

@@ -483,8 +483,6 @@ func (meta *KeyspaceMeta) MarshalJSON() ([]byte, error) {
 		CreatedAt      int64             `json:"created_at,omitempty"`
 		StateChangedAt int64             `json:"state_changed_at,omitempty"`
 		Config         map[string]string `json:"config,omitempty"`
-		Generation     uint64            `json:"generation,omitempty"`
-		RestoreVersion uint64            `json:"restore_version,omitempty"`
 	}{
 		meta.GetId(),
 		meta.Name,
@@ -492,8 +490,6 @@ func (meta *KeyspaceMeta) MarshalJSON() ([]byte, error) {
 		meta.CreatedAt,
 		meta.StateChangedAt,
 		meta.Config,
-		meta.Generation,
-		meta.RestoreVersion,
 	})
 }
 
@@ -506,8 +502,6 @@ func (meta *KeyspaceMeta) UnmarshalJSON(data []byte) error {
 		CreatedAt      int64             `json:"created_at,omitempty"`
 		StateChangedAt int64             `json:"state_changed_at,omitempty"`
 		Config         map[string]string `json:"config,omitempty"`
-		Generation     uint64            `json:"generation,omitempty"`
-		RestoreVersion uint64            `json:"restore_version,omitempty"`
 	}{}
 
 	if err := json.Unmarshal(data, aux); err != nil {
@@ -520,8 +514,6 @@ func (meta *KeyspaceMeta) UnmarshalJSON(data []byte) error {
 		CreatedAt:      aux.CreatedAt,
 		StateChangedAt: aux.StateChangedAt,
 		Config:         aux.Config,
-		Generation:     aux.Generation,
-		RestoreVersion: aux.RestoreVersion,
 	}
 	meta.KeyspaceMeta = pbMeta
 	return nil

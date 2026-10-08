@@ -82,6 +82,8 @@ type Config interface {
 	IsIDReuseEnabled() bool
 	GetIDReuseThreshold() uint64
 	GetIDReuseWorkerInterval() time.Duration
+	GetIDReuseBucketBytes() int
+	IsEncryptedIDReuseEnabled() bool
 	// GetMetaServiceGroups returns the meta-service groups for keyspace assignment.
 	// key is the meta-service group id and value is the meta-service group addresses.
 	SetMetaServiceGroups(map[string]string)
@@ -300,9 +302,7 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 	}
 	tracer.OnGetConfigFinished()
 
-	// The experimental CMEK path first claims a prepared free ID, then keeps the
-	// normal Create call pending until a second empty Restore installs the one
-	// selected encryption metadata file on every current peer.
+	// Reused Create waits for applied state; all destructive cleanup preceded the claim.
 	reused, task, err := manager.tryCreateReusedKeyspace(request.Name, request.Config, request.CreateTime)
 	if err != nil {
 		return nil, err
@@ -561,6 +561,17 @@ func (manager *Manager) saveNewKeyspace(keyspace *keyspacepb.KeyspaceMeta) error
 	defer manager.metaLock.Unlock(keyspace.GetId())
 
 	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		if manager.config.IsIDReuseEnabled() {
+			width := uint32(manager.bitmapBytes() * 8)
+			bucket, err := txn.Load(bitmapPath(keyspace.GetId() / width))
+			if err != nil {
+				return err
+			}
+			bit := keyspace.GetId() % width
+			if len(bucket) != 0 && (len(bucket) != manager.bitmapBytes() || bucket[bit/8]&(1<<(bit%8)) != 0) {
+				return errors.New("a free ID must be claimed through normal Create")
+			}
+		}
 		// Save keyspace ID.
 		// Check if keyspace with that name already exists.
 		nameExists, _, err := manager.store.LoadKeyspaceID(txn, keyspace.Name)
@@ -789,6 +800,9 @@ func (manager *Manager) LoadKeyspace(name string) (*keyspacepb.KeyspaceMeta, err
 		if meta == nil {
 			return errs.ErrKeyspaceNotFound
 		}
+		if meta.State == keyspacepb.KeyspaceState_CREATING {
+			return errs.ErrKeyspaceNotFound
+		}
 		return nil
 	})
 	if manager.mgm != nil && meta != nil {
@@ -933,11 +947,6 @@ func (manager *Manager) updateKeyspaceConfigTxn(name string, update func(meta *k
 		}
 		if meta == nil {
 			return errs.ErrKeyspaceNotFound
-		}
-		if pending, err := txn.Load(keypath.KeyspaceResetPath(id)); err != nil {
-			return err
-		} else if pending != "" {
-			return errors.New("cannot change config while a keyspace reset is pending")
 		}
 		// Only keyspace with state listed in allowChangeConfig are allowed to change their config.
 		if !slice.Contains(allowChangeConfig, meta.GetState()) {
@@ -1167,14 +1176,8 @@ func (manager *Manager) unassignKeyspaceFromMetaServiceGroup(txn kv.Txn, meta *k
 
 // transformKeyspaceState transforms the keyspace state to the target state and record the update time.
 func (manager *Manager) transformKeyspaceState(txn kv.Txn, meta *keyspacepb.KeyspaceMeta, newState keyspacepb.KeyspaceState, now int64) error {
-	if newState == keyspacepb.KeyspaceState_ENABLED {
-		pending, err := txn.Load(keypath.KeyspaceResetPath(meta.GetId()))
-		if err != nil {
-			return err
-		}
-		if pending != "" {
-			return errors.New("cannot enable a keyspace while its reset is pending")
-		}
+	if isReusePending(meta.State) || isReusePending(newState) {
+		return errors.New("reuse lifecycle is managed internally")
 	}
 	// If already in the target state, do nothing and return. A TOMBSTONE keyspace
 	// still carrying a meta-service group binding (e.g. one tombstoned before this

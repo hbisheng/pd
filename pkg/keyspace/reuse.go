@@ -16,357 +16,256 @@ package keyspace
 
 import (
 	"bytes"
+	"container/list"
 	"context"
-	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"reflect"
-	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
-
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.uber.org/zap"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/log"
-
 	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/errs"
+	"github.com/tikv/pd/pkg/keyspace/constant"
 	mcsconstant "github.com/tikv/pd/pkg/mcs/utils/constant"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
 	"github.com/tikv/pd/pkg/utils/keypath"
+	"github.com/tikv/pd/pkg/utils/typeutil"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/zap"
 )
 
 const (
-	// MinimumKeyspaceReuseTombstoneDuration is the mandatory quarantine after
-	// Cleaner finishes its ordinary cleanup and records TOMBSTONE.
-	MinimumKeyspaceReuseTombstoneDuration = 30 * 24 * time.Hour
+	MinimumKeyspaceReuseTombstoneDuration = 7 * 24 * time.Hour
 	freeIDScanLimit                       = 32
-	keyspaceStateRequestLimit             = 64
+	reuseProtocolVersion                  = 2
+	storageReportTTL                      = 10 * time.Minute
 )
 
-type reuseTask struct {
-	Phase                  keyspacepb.KeyspaceTaskPhase `json:"phase"`
-	KeyspaceID             uint32                       `json:"keyspace_id"`
-	Name                   string                       `json:"name"`
-	Config                 map[string]string            `json:"config,omitempty"`
-	TombstoneChangedAt     int64                        `json:"tombstone_changed_at,omitempty"`
-	ExpectedGeneration     uint64                       `json:"expected_generation"`
-	Generation             uint64                       `json:"generation"`
-	ExpectedRestoreVersion uint64                       `json:"expected_restore_version"`
-	RestoreVersion         uint64                       `json:"restore_version"`
-	RegionID               uint64                       `json:"region_id"`
-	RegionVersion          uint64                       `json:"region_version"`
-	ConfVer                uint64                       `json:"conf_ver"`
-	EncryptionMetaFileID   uint64                       `json:"encryption_meta_file_id,omitempty"`
+type storageReport struct {
+	version, confVer, leader uint64
+	state                    pdpb.RegionStorageState
+	receivedAt               time.Time
 }
 
-func (task *reuseTask) proto() *keyspacepb.KeyspaceTask {
-	if task == nil {
-		return nil
-	}
-	return &keyspacepb.KeyspaceTask{
-		Phase:                  task.Phase,
-		KeyspaceId:             task.KeyspaceID,
-		ExpectedGeneration:     task.ExpectedGeneration,
-		Generation:             task.Generation,
-		ExpectedRestoreVersion: task.ExpectedRestoreVersion,
-		RestoreVersion:         task.RestoreVersion,
-		RegionId:               task.RegionID,
-		RegionVersion:          task.RegionVersion,
-		ConfVer:                task.ConfVer,
-		EncryptionMetaFileId:   task.EncryptionMetaFileID,
-	}
-}
-
+// Only lifecycle metadata and bitmap buckets are durable. This index is rebuilt
+// on leadership changes; heartbeat handlers never load metadata from etcd.
 type reuseState struct {
-	reclaimMu  sync.Mutex
 	mu         sync.RWMutex
-	tasks      map[uint32]*reuseTask
+	pending    map[uint32]*keyspacepb.KeyspaceMeta
+	workQueue  *list.List
+	workItems  map[uint32]*list.Element
 	byRegion   map[uint64]uint32
-	statuses   map[uint64]*pdpb.KeyspaceStateStatus
+	reports    map[uint64]storageReport
 	capable    map[uint64]bool
+	watermark  uint64
 	notify     func(*core.RegionInfo)
 	now        func() time.Time
 	retention  time.Duration
-	workerNext uint32
-	storeNext  map[uint64]uint32
 	workerStop context.CancelFunc
 	workerDone chan struct{}
 }
 
 func newReuseState() *reuseState {
-	return &reuseState{
-		tasks:     make(map[uint32]*reuseTask),
-		byRegion:  make(map[uint64]uint32),
-		statuses:  make(map[uint64]*pdpb.KeyspaceStateStatus),
-		capable:   make(map[uint64]bool),
-		now:       time.Now,
-		retention: MinimumKeyspaceReuseTombstoneDuration,
-		storeNext: make(map[uint64]uint32),
-	}
+	return &reuseState{pending: make(map[uint32]*keyspacepb.KeyspaceMeta), workQueue: list.New(), workItems: make(map[uint32]*list.Element), byRegion: make(map[uint64]uint32),
+		reports: make(map[uint64]storageReport), capable: make(map[uint64]bool), now: time.Now,
+		retention: MinimumKeyspaceReuseTombstoneDuration}
 }
-
-func marshalReuseTask(task *reuseTask) (string, error) {
-	value, err := json.Marshal(task)
-	return string(value), err
-}
-
-func unmarshalReuseTask(value string) (*reuseTask, error) {
-	task := &reuseTask{}
-	if err := json.Unmarshal([]byte(value), task); err != nil {
-		return nil, err
-	}
-	return task, nil
-}
-
-func encodeFreeID(generation, restoreVersion uint64) string {
-	value := make([]byte, 16)
-	binary.BigEndian.PutUint64(value[:8], generation)
-	binary.BigEndian.PutUint64(value[8:], restoreVersion)
-	return string(value)
-}
-
-func decodeFreeID(value string) (uint64, uint64, error) {
-	if len(value) != 16 {
-		return 0, 0, errors.Errorf("invalid free keyspace record length %d", len(value))
-	}
-	return binary.BigEndian.Uint64([]byte(value[:8])), binary.BigEndian.Uint64([]byte(value[8:])), nil
-}
-
 func cloneKeyspaceConfig(config map[string]string) map[string]string {
-	cloned := make(map[string]string, len(config))
-	for key, value := range config {
-		cloned[key] = value
+	result := make(map[string]string, len(config))
+	for k, v := range config {
+		result[k] = v
 	}
-	return cloned
+	return result
 }
-
 func configForRetry(config map[string]string) map[string]string {
-	cloned := cloneKeyspaceConfig(config)
-	delete(cloned, MetaServiceGroupIDKey)
-	delete(cloned, MetaServiceGroupAddressesKey)
-	return cloned
+	result := cloneKeyspaceConfig(config)
+	delete(result, MetaServiceGroupIDKey)
+	delete(result, MetaServiceGroupAddressesKey)
+	return result
 }
-
-func freeIDFromPath(path string) (uint32, error) {
-	id := strings.TrimPrefix(path, keypath.KeyspaceFreePrefix())
-	value, err := strconv.ParseUint(id, 10, 32)
-	return uint32(value), err
+func isReusePending(state keyspacepb.KeyspaceState) bool {
+	return state == keyspacepb.KeyspaceState_RECLAIMING || state == keyspacepb.KeyspaceState_RECLAIMED || state == keyspacepb.KeyspaceState_CREATING
 }
-
-func (manager *Manager) cacheReuseTask(task *reuseTask) {
-	manager.reuse.mu.Lock()
-	if old := manager.reuse.tasks[task.KeyspaceID]; old != nil {
-		delete(manager.reuse.byRegion, old.RegionID)
+func reusableKeyspaceID(id uint32) bool {
+	return id != constant.DefaultKeyspaceID && uint64(id) < constant.ReservedKeyspaceIDStart
+}
+func (manager *Manager) transactionalReuseConfig(config map[string]string) bool {
+	bound := config[RegionBoundType]
+	if bound == "" {
+		return manager.getRegionBoundType() == txnRegionBound
 	}
-	// A status is evidence for exactly one installed task phase. In particular,
-	// reclaim-applied reports have the same lineage as the later reused-Create
-	// validation task, so retaining them would let Create skip a fresh peer
-	// report round.
-	for peerID, status := range manager.reuse.statuses {
-		if status.GetKeyspaceId() == task.KeyspaceID {
-			delete(manager.reuse.statuses, peerID)
+	return bound == txnRegionBound.String()
+}
+func isKeyspaceEncrypted(config map[string]string) bool {
+	if config["encryption"] == "" {
+		return false
+	}
+	var value struct {
+		Enabled bool `json:"enabled"`
+	}
+	return json.Unmarshal([]byte(config["encryption"]), &value) != nil || value.Enabled
+}
+func (manager *Manager) cacheReuseMeta(meta *keyspacepb.KeyspaceMeta) {
+	manager.reuse.mu.Lock()
+	defer manager.reuse.mu.Unlock()
+	for region, id := range manager.reuse.byRegion {
+		if id == meta.GetId() && meta.State != keyspacepb.KeyspaceState_RECLAIMED {
+			delete(manager.reuse.byRegion, region)
 		}
 	}
-	copy := *task
-	copy.Config = cloneKeyspaceConfig(task.Config)
-	manager.reuse.tasks[task.KeyspaceID] = &copy
-	manager.reuse.byRegion[task.RegionID] = task.KeyspaceID
-	manager.reuse.mu.Unlock()
-}
-
-func (manager *Manager) removeCachedReuseTask(id uint32) {
-	manager.reuse.mu.Lock()
-	if task := manager.reuse.tasks[id]; task != nil {
-		delete(manager.reuse.byRegion, task.RegionID)
+	if isReusePending(meta.State) {
+		if manager.reuse.workItems[meta.GetId()] == nil {
+			manager.reuse.workItems[meta.GetId()] = manager.reuse.workQueue.PushBack(meta.GetId())
+		}
+		copy := *meta
+		copy.Config = cloneKeyspaceConfig(meta.Config)
+		manager.reuse.pending[meta.GetId()] = &copy
+	} else {
+		delete(manager.reuse.pending, meta.GetId())
+		if item := manager.reuse.workItems[meta.GetId()]; item != nil {
+			manager.reuse.workQueue.Remove(item)
+			delete(manager.reuse.workItems, meta.GetId())
+		}
 	}
-	delete(manager.reuse.tasks, id)
-	manager.reuse.mu.Unlock()
+	manager.keyspaceStateLookup.Store(meta.GetId(), meta.State)
+}
+func (manager *Manager) currentReuseMeta(id uint32) *keyspacepb.KeyspaceMeta {
+	manager.reuse.mu.RLock()
+	defer manager.reuse.mu.RUnlock()
+	return manager.reuse.pending[id]
 }
 
-func (manager *Manager) loadReuseTasks() error {
-	loaded := make(map[uint32]*reuseTask)
-	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		prefix := keypath.KeyspaceResetPrefix()
-		_, values, err := txn.LoadRange(prefix, clientv3.GetPrefixRangeEnd(prefix), 0)
-		if err != nil {
+// StartIDReuse reloads pending lifecycle states in pages after leader election.
+func (manager *Manager) StartIDReuse() error {
+	// The allocator's in-memory window starts at zero after restart. Read its
+	// existing durable counter once, rather than requiring a new allocation.
+	var watermark uint64
+	if err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		value, err := txn.Load(keypath.KeyspaceAllocIDPath())
+		if err != nil || value == "" {
 			return err
 		}
-		for _, value := range values {
-			task, err := unmarshalReuseTask(value)
-			if err != nil {
-				return err
-			}
-			loaded[task.KeyspaceID] = task
-		}
-		return nil
-	})
-	if err != nil {
+		watermark, err = typeutil.BytesToUint64([]byte(value))
+		return err
+	}); err != nil {
 		return err
 	}
 	manager.reuse.mu.Lock()
-	manager.reuse.tasks = loaded
-	manager.reuse.byRegion = make(map[uint64]uint32, len(loaded))
-	manager.reuse.statuses = make(map[uint64]*pdpb.KeyspaceStateStatus)
+	manager.reuse.watermark = watermark
+	manager.reuse.pending = make(map[uint32]*keyspacepb.KeyspaceMeta)
+	manager.reuse.workQueue = list.New()
+	manager.reuse.workItems = make(map[uint32]*list.Element)
+	manager.reuse.byRegion = make(map[uint64]uint32)
+	manager.reuse.reports = make(map[uint64]storageReport)
 	manager.reuse.capable = make(map[uint64]bool)
-	manager.reuse.storeNext = make(map[uint64]uint32)
-	for id, task := range loaded {
-		manager.reuse.byRegion[task.RegionID] = id
-	}
 	manager.reuse.mu.Unlock()
-	return nil
-}
-
-// StartIDReuse reloads durable tasks and starts their retry worker. PD calls it
-// whenever this server becomes the cluster leader so tasks created before a
-// restart or leadership transfer are retried from persistent state.
-func (manager *Manager) StartIDReuse() error {
-	if err := manager.loadReuseTasks(); err != nil {
+	var start uint32
+	for {
+		metas, err := manager.LoadRangeKeyspace(start, 256)
+		if err != nil {
+			return err
+		}
+		for _, meta := range metas {
+			if isReusePending(meta.State) {
+				manager.cacheReuseMeta(meta)
+			}
+		}
+		if len(metas) < 256 {
+			break
+		}
+		start = metas[len(metas)-1].GetId() + 1
+	}
+	if !manager.config.IsIDReuseEnabled() {
+		return nil
+	}
+	if err := manager.ensureBitmapLayout(); err != nil {
 		return err
 	}
 	manager.startReuseWorker()
 	return nil
 }
 
-// StopIDReuse stops leader-only retry work before the raft cluster is stopped.
+// StopIDReuse joins leader-only retry work.
 func (manager *Manager) StopIDReuse() {
 	manager.reuse.mu.Lock()
-	stop := manager.reuse.workerStop
-	done := manager.reuse.workerDone
+	stop, done := manager.reuse.workerStop, manager.reuse.workerDone
 	manager.reuse.workerStop = nil
 	manager.reuse.workerDone = nil
 	manager.reuse.mu.Unlock()
-	if stop == nil {
-		return
+	if stop != nil {
+		stop()
+		<-done
 	}
-	stop()
-	<-done
 }
 
-func (manager *Manager) loadReuseTask(txn kv.Txn, id uint32) (*reuseTask, string, error) {
-	value, err := txn.Load(keypath.KeyspaceResetPath(id))
-	if err != nil || value == "" {
-		return nil, value, err
-	}
-	task, err := unmarshalReuseTask(value)
-	return task, value, err
-}
-
-// SetKeyspaceUpdateNotifier installs the direct Region-heartbeat notification
-// callback. It is invoked only after durable task state is committed.
+// SetKeyspaceUpdateNotifier installs the generic Region notification callback.
 func (manager *Manager) SetKeyspaceUpdateNotifier(notify func(*core.RegionInfo)) {
 	manager.reuse.mu.Lock()
 	manager.reuse.notify = notify
 	manager.reuse.mu.Unlock()
 }
 
-func (manager *Manager) notifyReuseTask(task *reuseTask) {
-	region := manager.cluster.GetBasicCluster().GetRegion(task.RegionID)
-	if region == nil {
-		return
-	}
-	manager.reuse.mu.RLock()
-	notify := manager.reuse.notify
-	manager.reuse.mu.RUnlock()
-	if notify != nil {
-		notify(region)
-	}
-}
-
-// KeyspaceUpdateRequiredForRegion is an O(1) heartbeat-path lookup.
+// KeyspaceUpdateRequiredForRegion is an O(1) lookup of pending work.
 func (manager *Manager) KeyspaceUpdateRequiredForRegion(regionID uint64) bool {
 	manager.reuse.mu.RLock()
-	_, ok := manager.reuse.byRegion[regionID]
-	manager.reuse.mu.RUnlock()
-	return ok
+	defer manager.reuse.mu.RUnlock()
+	id, ok := manager.reuse.byRegion[regionID]
+	meta := manager.reuse.pending[id]
+	if !ok || meta == nil {
+		return false
+	}
+	if meta.State == keyspacepb.KeyspaceState_RECLAIMED {
+		report, known := manager.reuse.reports[regionID]
+		return !known || manager.reuse.now().Sub(report.receivedAt) > storageReportTTL
+	}
+	return meta.State == keyspacepb.KeyspaceState_RECLAIMING || meta.State == keyspacepb.KeyspaceState_CREATING
 }
 
-// LoadKeyspaceWithTask loads metadata and the current durable task in one
-// transaction so CSE never observes a mixed control-plane snapshot.
-func (manager *Manager) LoadKeyspaceWithTask(id uint32) (*keyspacepb.KeyspaceMeta, *keyspacepb.KeyspaceTask, error) {
-	var meta *keyspacepb.KeyspaceMeta
-	var task *reuseTask
-	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		var err error
-		meta, err = manager.store.LoadKeyspaceMeta(txn, id)
-		if err != nil {
-			return err
-		}
-		if meta == nil {
-			return errs.ErrKeyspaceNotFound
-		}
-		task, _, err = manager.loadReuseTask(txn, id)
-		return err
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	if manager.mgm != nil {
-		manager.mgm.AttachEndpoints(meta.GetConfig())
-	}
-	return meta, task.proto(), nil
+// RecordIDReuseCapability rejects stores speaking the earlier POC protocol.
+func (manager *Manager) RecordIDReuseCapability(storeID uint64, version uint32) {
+	manager.reuse.mu.Lock()
+	manager.reuse.capable[storeID] = version >= reuseProtocolVersion
+	manager.reuse.mu.Unlock()
 }
 
-func (manager *Manager) exactKeyspaceRegion(id uint32) (*core.RegionInfo, error) {
-	if manager.cluster == nil {
-		return nil, errors.New("raft cluster is unavailable")
+// RecordRegionStorageState records actual applied state from accepted leader
+// heartbeats. Reports are scoped to an epoch and are never durable.
+func (manager *Manager) RecordRegionStorageState(region *core.RegionInfo, state *pdpb.RegionStorageState) {
+	manager.reuse.mu.Lock()
+	defer manager.reuse.mu.Unlock()
+	if _, pending := manager.reuse.byRegion[region.GetID()]; !pending {
+		return
 	}
-	bound := MakeRegionBound(id)
-	regions := manager.cluster.GetBasicCluster().ScanRegions(bound.TxnLeftBound, bound.TxnRightBound, 2)
-	if len(regions) != 1 {
-		return nil, errors.Errorf("keyspace %d must have exactly one transaction Region, got %d", id, len(regions))
+	if state == nil {
+		delete(manager.reuse.reports, region.GetID())
+		return
 	}
-	region := regions[0]
-	if !bytes.Equal(region.GetStartKey(), bound.TxnLeftBound) || !bytes.Equal(region.GetEndKey(), bound.TxnRightBound) {
-		return nil, errors.Errorf("region %d does not exactly cover transaction keyspace %d", region.GetID(), id)
-	}
-	return region, nil
+	manager.reuse.reports[region.GetID()] = storageReport{version: region.GetRegionEpoch().GetVersion(), confVer: region.GetRegionEpoch().GetConfVer(), leader: region.GetLeader().GetId(), state: *state, receivedAt: manager.reuse.now()}
 }
-
+func (manager *Manager) appliedStorageState(region *core.RegionInfo) *pdpb.RegionStorageState {
+	manager.reuse.mu.RLock()
+	defer manager.reuse.mu.RUnlock()
+	report, ok := manager.reuse.reports[region.GetID()]
+	if !ok || manager.reuse.now().Sub(report.receivedAt) > storageReportTTL || report.version != region.GetRegionEpoch().GetVersion() || report.confVer != region.GetRegionEpoch().GetConfVer() ||
+		report.leader != region.GetLeader().GetId() || len(region.GetPendingPeers()) != 0 || len(region.GetDownPeers()) != 0 {
+		return nil
+	}
+	copy := report.state
+	return &copy
+}
 func (manager *Manager) rejectIndependentScheduling() error {
-	if cluster, ok := manager.cluster.(interface{ IsServiceIndependent(string) bool }); ok &&
-		cluster.IsServiceIndependent(mcsconstant.SchedulingServiceName) {
+	if cluster, ok := manager.cluster.(interface{ IsServiceIndependent(string) bool }); ok && cluster.IsServiceIndependent(mcsconstant.SchedulingServiceName) {
 		return errors.New("keyspace ID reuse is unsupported with independent scheduling service")
 	}
 	return nil
 }
-
-func isKeyspaceEncrypted(config map[string]string) bool {
-	value := config["encryption"]
-	if value == "" {
-		return false
-	}
-	var encryption struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := json.Unmarshal([]byte(value), &encryption); err != nil {
-		return true
-	}
-	return encryption.Enabled
-}
-
-func (manager *Manager) validateReclaimMeta(id uint32, meta *keyspacepb.KeyspaceMeta) error {
-	if meta == nil {
-		return errs.ErrKeyspaceNotFound
-	}
-	if meta.GetState() != keyspacepb.KeyspaceState_TOMBSTONE {
-		return errors.Errorf("cannot reclaim keyspace in state %s", meta.GetState().String())
-	}
-	if manager.reuse.now().Sub(time.Unix(meta.GetStateChangedAt(), 0)) < manager.reuse.retention {
-		return errors.Errorf("keyspace %d has not completed the %s tombstone quarantine", id, manager.reuse.retention)
-	}
-	if isKeyspaceEncrypted(meta.GetConfig()) {
-		return errors.New("phase-one keyspace ID reuse does not reclaim encrypted keyspaces")
-	}
-	return nil
-}
-
 func (manager *Manager) reuseAdmissionReady(region *core.RegionInfo) error {
 	if !manager.config.IsIDReuseEnabled() {
 		return errors.New("keyspace ID reuse is disabled")
@@ -376,197 +275,276 @@ func (manager *Manager) reuseAdmissionReady(region *core.RegionInfo) error {
 	}
 	allocator, ok := manager.idAllocator.(interface{ GetReservedWindowEnd() uint64 })
 	if !ok {
-		return errors.New("keyspace allocator does not expose its reserved window end")
+		return errors.New("allocator does not expose its reuse watermark")
 	}
-	if end := allocator.GetReservedWindowEnd(); end < manager.config.GetIDReuseThreshold() {
-		return errors.Errorf("keyspace allocator reserved window end %d is below reuse threshold %d", end, manager.config.GetIDReuseThreshold())
-	}
+	currentWindow := allocator.GetReservedWindowEnd()
 	manager.reuse.mu.RLock()
 	defer manager.reuse.mu.RUnlock()
+	if max(currentWindow, manager.reuse.watermark) < manager.config.GetIDReuseThreshold() {
+		return errors.New("allocator watermark is below reuse threshold")
+	}
 	for _, peer := range region.GetPeers() {
 		if !manager.reuse.capable[peer.GetStoreId()] {
-			return errors.Errorf("store %d has not reported keyspace ID reuse capability", peer.GetStoreId())
+			return errors.Errorf("store %d has not reported reuse protocol v2", peer.GetStoreId())
 		}
 	}
 	return nil
 }
-
-// RecordKeyspaceStateStatuses records only task-scoped reports explicitly
-// requested by PD. Reports remain ephemeral across PD restarts.
-func (manager *Manager) RecordKeyspaceStateStatuses(storeID uint64, capable bool, statuses []*pdpb.KeyspaceStateStatus) {
-	manager.reuse.mu.Lock()
-	manager.reuse.capable[storeID] = capable
-	changed := make(map[uint32]struct{})
-	for _, status := range statuses {
-		task := manager.reuse.tasks[status.GetKeyspaceId()]
-		if task == nil || task.RegionID != status.GetRegionId() {
-			continue
-		}
-		region := manager.cluster.GetBasicCluster().GetRegion(status.GetRegionId())
-		if region == nil || region.GetRegionEpoch().GetVersion() != status.GetRegionVersion() ||
-			region.GetRegionEpoch().GetConfVer() != status.GetConfVer() {
-			continue
-		}
-		for _, peer := range region.GetPeers() {
-			if peer.GetId() == status.GetPeerId() && peer.GetStoreId() == storeID {
-				copy := *status
-				manager.reuse.statuses[peer.GetId()] = &copy
-				changed[status.GetKeyspaceId()] = struct{}{}
-				break
-			}
-		}
-	}
-	manager.reuse.mu.Unlock()
-	for id := range changed {
-		manager.advanceReuseTask(id)
-	}
-}
-
-func statusMatchesTask(status *pdpb.KeyspaceStateStatus, task *reuseTask, region *core.RegionInfo) bool {
-	if status == nil || status.GetRegionId() != region.GetID() || status.GetKeyspaceId() != task.KeyspaceID ||
-		status.GetRegionVersion() != region.GetRegionEpoch().GetVersion() ||
-		status.GetConfVer() != region.GetRegionEpoch().GetConfVer() {
-		return false
-	}
-	switch task.Phase {
-	case keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_PREPARE_RECLAIM:
-		return true
-	case keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_RECLAIM,
-		keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_VALIDATE_REUSE:
-		if status.GetGeneration() != task.Generation || status.GetRestoreVersion() != task.RestoreVersion {
-			return false
-		}
-		if task.Phase == keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_VALIDATE_REUSE {
-			return task.EncryptionMetaFileID != 0 &&
-				status.GetEncryptionMetaFileId() == task.EncryptionMetaFileID && status.GetKeyReady()
-		}
-		return true
-	default:
-		return false
-	}
-}
-
-// KeyspaceStateRequests returns a bounded set of missing/stale reports for one
-// store. It iterates active tasks, never the cluster's Region set.
-func (manager *Manager) KeyspaceStateRequests(storeID uint64) []*pdpb.KeyspaceStateRequest {
-	manager.reuse.mu.Lock()
-	defer manager.reuse.mu.Unlock()
-	ids := make([]uint32, 0, len(manager.reuse.tasks))
-	for id := range manager.reuse.tasks {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	requests := make([]*pdpb.KeyspaceStateRequest, 0, min(len(ids), keyspaceStateRequestLimit))
-	start := sort.Search(len(ids), func(index int) bool { return ids[index] > manager.reuse.storeNext[storeID] })
-	for offset := range ids {
-		id := ids[(start+offset)%len(ids)]
-		manager.reuse.storeNext[storeID] = id
-		task := manager.reuse.tasks[id]
-		region := manager.cluster.GetBasicCluster().GetRegion(task.RegionID)
-		if region == nil {
-			continue
-		}
-		for _, peer := range region.GetPeers() {
-			if peer.GetStoreId() == storeID && !statusMatchesTask(manager.reuse.statuses[peer.GetId()], task, region) {
-				requests = append(requests, &pdpb.KeyspaceStateRequest{RegionId: task.RegionID, KeyspaceId: id})
-				break
-			}
-		}
-		if len(requests) == keyspaceStateRequestLimit {
-			break
-		}
-	}
-	return requests
-}
-
-func (manager *Manager) currentTask(id uint32) *reuseTask {
-	manager.reuse.mu.RLock()
-	defer manager.reuse.mu.RUnlock()
-	task := manager.reuse.tasks[id]
-	if task == nil {
+func (manager *Manager) coveringKeyspaceRegion(id uint32) *core.RegionInfo {
+	if manager.cluster == nil {
 		return nil
 	}
-	copy := *task
-	copy.Config = cloneKeyspaceConfig(task.Config)
-	return &copy
+	bound := MakeRegionBound(id)
+	regions := manager.cluster.GetBasicCluster().ScanRegions(bound.TxnLeftBound, bound.TxnRightBound, 2)
+	if len(regions) != 1 {
+		return nil
+	}
+	region := regions[0]
+	if bytes.Compare(region.GetStartKey(), bound.TxnLeftBound) > 0 ||
+		(len(region.GetEndKey()) != 0 && bytes.Compare(region.GetEndKey(), bound.TxnRightBound) < 0) {
+		return nil
+	}
+	return region
+}
+func (manager *Manager) exactKeyspaceRegion(id uint32) (*core.RegionInfo, error) {
+	region := manager.coveringKeyspaceRegion(id)
+	bound := MakeRegionBound(id)
+	if region == nil || !bytes.Equal(region.GetStartKey(), bound.TxnLeftBound) || !bytes.Equal(region.GetEndKey(), bound.TxnRightBound) {
+		return nil, errors.Errorf("keyspace %d does not have one complete Region", id)
+	}
+	return region, nil
 }
 
-func (manager *Manager) currentAppliedState(task *reuseTask, region *core.RegionInfo) (uint64, uint64, error) {
-	manager.reuse.mu.RLock()
-	defer manager.reuse.mu.RUnlock()
-	var generation, restoreVersion uint64
-	for i, peer := range region.GetPeers() {
-		status := manager.reuse.statuses[peer.GetId()]
-		if !statusMatchesTask(status, task, region) {
-			return 0, 0, errors.Errorf("missing current applied status for peer %d", peer.GetId())
-		}
-		if i == 0 {
-			generation, restoreVersion = status.GetGeneration(), status.GetRestoreVersion()
-		} else if generation != status.GetGeneration() || restoreVersion != status.GetRestoreVersion() {
-			return 0, 0, errors.Errorf("keyspace %d peers disagree on applied lineage", task.KeyspaceID)
-		}
-	}
-	return generation, restoreVersion, nil
-}
-
-func (manager *Manager) taskApplied(task *reuseTask, region *core.RegionInfo) bool {
-	wantVersion := task.RegionVersion
-	if task.Phase == keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_RECLAIM ||
-		task.Phase == keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_VALIDATE_REUSE {
-		wantVersion++
-	}
-	if region.GetID() != task.RegionID || region.GetRegionEpoch().GetVersion() != wantVersion {
+// Reclaim only resets an isolated range. Unknown neighbors, missing metadata,
+// and unused gaps all leave room for merge and must not authorize Restore.
+func (manager *Manager) isolatedKeyspace(id uint32, region *core.RegionInfo) bool {
+	left, right := manager.cluster.GetBasicCluster().GetAdjacentRegions(region)
+	if left == nil || right == nil || id == 0 || id >= 0xffffff {
 		return false
 	}
-	manager.reuse.mu.RLock()
-	defer manager.reuse.mu.RUnlock()
-	for _, peer := range region.GetPeers() {
-		if !statusMatchesTask(manager.reuse.statuses[peer.GetId()], task, region) {
+	for _, neighborID := range []uint32{id - 1, id + 1} {
+		meta, err := manager.LoadKeyspaceByID(neighborID)
+		if err != nil || meta == nil || (meta.State != keyspacepb.KeyspaceState_ENABLED && meta.State != keyspacepb.KeyspaceState_DISABLED && meta.State != keyspacepb.KeyspaceState_CREATING) {
+			return false
+		}
+		// Verify the touching Region overlaps that active keyspace. Its tenant may
+		// have several Regions, so this neighbor need not cover the whole keyspace.
+		bound := MakeRegionBound(neighborID)
+		neighbor := left
+		if neighborID > id {
+			neighbor = right
+		}
+		if bytes.Compare(neighbor.GetStartKey(), bound.TxnRightBound) >= 0 ||
+			(len(neighbor.GetEndKey()) != 0 && bytes.Compare(neighbor.GetEndKey(), bound.TxnLeftBound) <= 0) {
 			return false
 		}
 	}
 	return true
 }
-
-func (manager *Manager) currentPeersAtExpectedState(task *reuseTask, region *core.RegionInfo) bool {
-	if (task.Phase != keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_RECLAIM &&
-		task.Phase != keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_VALIDATE_REUSE) ||
-		region.GetID() != task.RegionID || region.GetRegionEpoch().GetVersion() != task.RegionVersion {
-		return false
-	}
-	manager.reuse.mu.RLock()
-	defer manager.reuse.mu.RUnlock()
-	for _, peer := range region.GetPeers() {
-		status := manager.reuse.statuses[peer.GetId()]
-		if status == nil || status.GetRegionId() != region.GetID() || status.GetKeyspaceId() != task.KeyspaceID ||
-			status.GetRegionVersion() != region.GetRegionEpoch().GetVersion() ||
-			status.GetConfVer() != region.GetRegionEpoch().GetConfVer() ||
-			status.GetGeneration() != task.ExpectedGeneration ||
-			status.GetRestoreVersion() != task.ExpectedRestoreVersion {
-			return false
+func (manager *Manager) transitionReuse(id uint32, from, to keyspacepb.KeyspaceState) error {
+	manager.metaLock.Lock(id)
+	defer manager.metaLock.Unlock(id)
+	var meta *keyspacepb.KeyspaceMeta
+	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		var err error
+		meta, err = manager.store.LoadKeyspaceMeta(txn, id)
+		if err != nil {
+			return err
 		}
+		if meta == nil || meta.State != from {
+			return errors.New("keyspace lifecycle changed")
+		}
+		meta.State = to
+		meta.StateChangedAt = manager.reuse.now().Unix()
+		return manager.store.SaveKeyspaceMeta(txn, meta)
+	})
+	if err == nil {
+		manager.cacheReuseMeta(meta)
 	}
-	return true
+	return err
 }
 
-func (manager *Manager) startReuseWorker() {
-	manager.reuse.mu.Lock()
-	if manager.reuse.workerStop != nil {
+// RequestKeyspaceReclaim is idempotent and can be revisited by Data Cleaner.
+func (manager *Manager) RequestKeyspaceReclaim(id uint32) error {
+	if !reusableKeyspaceID(id) {
+		return newModifyProtectedKeyspaceError()
+	}
+	if !manager.config.IsIDReuseEnabled() {
+		return errors.New("keyspace ID reuse is disabled")
+	}
+	meta, err := manager.LoadKeyspaceByID(id)
+	if err != nil {
+		return err
+	}
+	if !manager.transactionalReuseConfig(meta.Config) {
+		return errors.New("ID reuse only supports transactional keyspaces")
+	}
+	if meta.State == keyspacepb.KeyspaceState_TOMBSTONE {
+		region := manager.coveringKeyspaceRegion(id)
+		if region == nil {
+			bound := MakeRegionBound(id)
+			region = manager.cluster.GetBasicCluster().GetRegionByKey(bound.TxnLeftBound)
+		}
+		if region == nil {
+			return errors.New("Region layout is unknown")
+		}
+		if err := manager.reuseAdmissionReady(region); err != nil {
+			return err
+		}
+		// The Region version does not change on ordinary writes. A clean report
+		// cached from a previous creation must not complete this reclamation.
+		manager.reuse.mu.Lock()
+		delete(manager.reuse.reports, region.GetID())
 		manager.reuse.mu.Unlock()
+		if err := manager.transitionReuse(id, keyspacepb.KeyspaceState_TOMBSTONE, keyspacepb.KeyspaceState_RECLAIMING); err != nil {
+			return err
+		}
+	} else if !isReusePending(meta.State) || meta.State == keyspacepb.KeyspaceState_CREATING {
+		return errors.Errorf("cannot reclaim keyspace in state %s", meta.State)
+	} else {
+		manager.cacheReuseMeta(meta)
+	}
+	manager.advanceReuseTask(id)
+	return nil
+}
+func (manager *Manager) indexReuseRegion(id uint32, region *core.RegionInfo, shouldNotify bool) {
+	manager.reuse.mu.Lock()
+	for r, k := range manager.reuse.byRegion {
+		if k == id && r != region.GetID() {
+			delete(manager.reuse.byRegion, r)
+		}
+	}
+	manager.reuse.byRegion[region.GetID()] = id
+	notify := manager.reuse.notify
+	manager.reuse.mu.Unlock()
+	if shouldNotify && notify != nil {
+		notify(region)
+	}
+}
+func (manager *Manager) unindexReuseRegion(id uint32) {
+	manager.reuse.mu.Lock()
+	defer manager.reuse.mu.Unlock()
+	for regionID, keyspaceID := range manager.reuse.byRegion {
+		if keyspaceID == id {
+			delete(manager.reuse.byRegion, regionID)
+		}
+	}
+}
+func (manager *Manager) advanceReuseTask(id uint32) {
+	cached := manager.currentReuseMeta(id)
+	if cached == nil || !manager.config.IsIDReuseEnabled() {
 		return
 	}
-	workerCtx, stop := context.WithCancel(manager.ctx)
+	// Cleaner may race a worker transition; reload the source of truth rather
+	// than leaving an older in-memory state pinned until another Cleaner run.
+	meta, err := manager.LoadKeyspaceByID(id)
+	if err != nil {
+		return
+	}
+	if cached.State != meta.State || cached.StateChangedAt != meta.StateChangedAt || cached.Name != meta.Name {
+		manager.cacheReuseMeta(meta)
+	}
+	if !isReusePending(meta.State) {
+		return
+	}
+	if meta.State == keyspacepb.KeyspaceState_CREATING {
+		rule := buildLabelRule(id, txnRegionBound)
+		if manager.cluster.GetRegionLabeler().GetLabelRule(rule.ID) == nil {
+			if err := manager.splitKeyspaceRegion(id, false, txnRegionBound); err != nil {
+				return
+			}
+		}
+	}
+	if meta.State == keyspacepb.KeyspaceState_RECLAIMED {
+		region := manager.coveringKeyspaceRegion(id)
+		if region == nil || manager.reuseAdmissionReady(region) != nil {
+			return
+		}
+		bound := MakeRegionBound(id)
+		if bytes.Equal(region.GetStartKey(), bound.TxnLeftBound) && bytes.Equal(region.GetEndKey(), bound.TxnRightBound) {
+			state := manager.appliedStorageState(region)
+			manager.indexReuseRegion(id, region, state == nil)
+			if state == nil {
+				return
+			}
+			if !state.ReclaimReady {
+				// Continue observing during quarantine. Dirty state invalidates
+				// completion, and the next successful cleanup starts a new wait.
+				_ = manager.transitionReuse(id, meta.State, keyspacepb.KeyspaceState_RECLAIMING)
+				return
+			}
+		}
+		if manager.reuse.now().Sub(time.Unix(meta.StateChangedAt, 0)) >= manager.reuse.retention {
+			_ = manager.releaseReclaimedID(meta)
+		}
+		return
+	}
+	region := manager.coveringKeyspaceRegion(id)
+	if region == nil {
+		manager.unindexReuseRegion(id)
+		return
+	}
+	if manager.reuseAdmissionReady(region) != nil {
+		return
+	}
+	bound := MakeRegionBound(id)
+	exact := bytes.Equal(region.GetStartKey(), bound.TxnLeftBound) && bytes.Equal(region.GetEndKey(), bound.TxnRightBound)
+	if meta.State == keyspacepb.KeyspaceState_RECLAIMING {
+		if !exact {
+			_ = manager.transitionReuse(id, meta.State, keyspacepb.KeyspaceState_RECLAIMED)
+			return
+		}
+		if !manager.isolatedKeyspace(id, region) {
+			manager.unindexReuseRegion(id)
+			return
+		}
+		manager.indexReuseRegion(id, region, true)
+		if state := manager.appliedStorageState(region); state != nil && state.ReclaimReady {
+			_ = manager.transitionReuse(id, meta.State, keyspacepb.KeyspaceState_RECLAIMED)
+		}
+	} else if meta.State == keyspacepb.KeyspaceState_CREATING {
+		if !exact {
+			_ = manager.splitKeyspaceRegion(id, false, txnRegionBound)
+			return
+		}
+		manager.indexReuseRegion(id, region, true)
+		state := manager.appliedStorageState(region)
+		if state == nil {
+			return
+		}
+		if isKeyspaceEncrypted(meta.Config) {
+			if state.EncryptionMetaFileId == 0 {
+				return
+			}
+		} else if !state.ReclaimReady {
+			return
+		}
+		if manager.kgm != nil {
+			if err := manager.kgm.UpdateKeyspaceForGroup(endpoint.StringUserKind(meta.Config[UserKindKey]), meta.Config[TSOKeyspaceGroupIDKey], id, opAdd); err != nil {
+				log.Warn("failed to bind reused keyspace group", zap.Uint32("keyspace-id", id), zap.Error(err))
+				return
+			}
+		}
+		_ = manager.transitionReuse(id, meta.State, keyspacepb.KeyspaceState_ENABLED)
+	}
+}
+func (manager *Manager) startReuseWorker() {
+	manager.reuse.mu.Lock()
+	defer manager.reuse.mu.Unlock()
+	if manager.reuse.workerStop != nil {
+		return
+	}
+	ctx, stop := context.WithCancel(manager.ctx)
 	done := make(chan struct{})
 	manager.reuse.workerStop = stop
 	manager.reuse.workerDone = done
-	manager.reuse.mu.Unlock()
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(manager.config.GetIDReuseWorkerInterval())
 		defer ticker.Stop()
 		for {
 			select {
-			case <-workerCtx.Done():
+			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				manager.runOneReuseTask()
@@ -574,306 +552,113 @@ func (manager *Manager) startReuseWorker() {
 		}
 	}()
 }
-
 func (manager *Manager) runOneReuseTask() {
 	manager.reuse.mu.Lock()
-	ids := make([]uint32, 0, len(manager.reuse.tasks))
-	for id := range manager.reuse.tasks {
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 {
+	item := manager.reuse.workQueue.Front()
+	if item == nil {
 		manager.reuse.mu.Unlock()
 		return
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	index := sort.Search(len(ids), func(index int) bool { return ids[index] > manager.reuse.workerNext })
-	if index == len(ids) {
-		index = 0
-	}
-	manager.reuse.workerNext = ids[index]
+	id := item.Value.(uint32)
+	manager.reuse.workQueue.MoveToBack(item)
 	manager.reuse.mu.Unlock()
-	task := manager.currentTask(ids[index])
-	if task == nil {
-		return
-	}
-	manager.advanceReuseTask(task.KeyspaceID)
-	if current := manager.currentTask(task.KeyspaceID); current != nil {
-		manager.notifyReuseTask(current)
-	}
+	manager.advanceReuseTask(id)
 }
-
-func (manager *Manager) advanceReuseTask(id uint32) {
-	task := manager.currentTask(id)
-	if task == nil {
-		return
-	}
-	region, err := manager.exactKeyspaceRegion(id)
-	if err != nil || region.GetID() != task.RegionID {
-		return
-	}
-	switch task.Phase {
-	case keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_PREPARE_RECLAIM:
-		manager.authorizeReclaim(task, region)
-	case keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_RECLAIM:
-		if manager.taskApplied(task, region) {
-			if err := manager.finishReclaim(task); err != nil {
-				log.Warn("failed to finalize keyspace reclamation", zap.Uint32("keyspace-id", id), zap.Error(err))
-			}
-		} else if region.GetRegionEpoch().GetConfVer() != task.ConfVer &&
-			manager.currentPeersAtExpectedState(task, region) {
-			if err := manager.rebindResetMembership(task, region); err != nil {
-				log.Warn("failed to rebind keyspace reclaim membership", zap.Uint32("keyspace-id", id), zap.Error(err))
-			}
-		}
-	case keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_VALIDATE_REUSE:
-		if manager.taskApplied(task, region) {
-			if err := manager.finishReusedCreate(task); err != nil {
-				log.Warn("failed to finalize reused keyspace creation", zap.Uint32("keyspace-id", id), zap.Error(err))
-			}
-		} else if region.GetRegionEpoch().GetConfVer() != task.ConfVer &&
-			manager.currentPeersAtExpectedState(task, region) {
-			if err := manager.rebindResetMembership(task, region); err != nil {
-				log.Warn("failed to rebind reused-Create membership", zap.Uint32("keyspace-id", id), zap.Error(err))
-			}
-		}
-	}
-}
-
-// rebindResetMembership recovers an authorized but not-yet-applied reset
-// after a membership-only change. Fresh reports from every current peer must
-// prove that the reset has not started; destructive lineage and Region version
-// are never rebased.
-func (manager *Manager) rebindResetMembership(expected *reuseTask, region *core.RegionInfo) error {
-	if region.GetRegionEpoch().GetVersion() != expected.RegionVersion ||
-		region.GetRegionEpoch().GetConfVer() == expected.ConfVer {
-		return errors.New("reset membership did not change independently")
-	}
-	currentRegion, err := manager.exactKeyspaceRegion(expected.KeyspaceID)
-	if err != nil || currentRegion.GetID() != region.GetID() ||
-		currentRegion.GetRegionEpoch().GetVersion() != region.GetRegionEpoch().GetVersion() ||
-		currentRegion.GetRegionEpoch().GetConfVer() != region.GetRegionEpoch().GetConfVer() {
-		return errors.New("keyspace Region changed during membership recovery")
-	}
-	updated := *expected
-	updated.ConfVer = region.GetRegionEpoch().GetConfVer()
-	value, err := marshalReuseTask(&updated)
-	if err != nil {
-		return err
-	}
-	err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		current, currentValue, err := manager.loadReuseTask(txn, expected.KeyspaceID)
+func keyspaceBitmapLayoutPath() string    { return keypath.KeyspaceFreePrefix() + "layout" }
+func bitmapPrefix() string                { return keypath.KeyspaceFreePrefix() + "buckets/" }
+func bitmapPath(bucket uint32) string     { return fmt.Sprintf("%s%08d", bitmapPrefix(), bucket) }
+func (manager *Manager) bitmapBytes() int { return manager.config.GetIDReuseBucketBytes() }
+func (manager *Manager) ensureBitmapLayout() error {
+	return manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		key := keypath.KeyspaceFreePrefix() + "layout"
+		layout := fmt.Sprintf("v1:%d", manager.bitmapBytes())
+		value, err := txn.Load(key)
 		if err != nil {
 			return err
 		}
-		expectedValue, err := marshalReuseTask(expected)
-		if err != nil || current == nil || currentValue != expectedValue {
-			return errors.New("keyspace reset authorization changed")
+		if value != "" && value != layout {
+			return errors.New("free bitmap layout differs from configured bucket size")
 		}
-		meta, err := manager.store.LoadKeyspaceMeta(txn, expected.KeyspaceID)
-		if err != nil {
-			return err
+		if value == "" {
+			return txn.Save(key, layout)
 		}
-		if meta == nil || meta.GetName() != expected.Name || meta.GetGeneration() != expected.ExpectedGeneration ||
-			meta.GetRestoreVersion() > expected.ExpectedRestoreVersion {
-			return errors.New("keyspace identity or lineage changed during membership recovery")
-		}
-		if expected.Phase == keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_RECLAIM {
-			if meta.GetState() != keyspacepb.KeyspaceState_TOMBSTONE || meta.GetStateChangedAt() != expected.TombstoneChangedAt {
-				return errors.New("tombstone identity changed during membership recovery")
-			}
-		} else if expected.Phase == keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_VALIDATE_REUSE {
-			if meta.GetState() != keyspacepb.KeyspaceState_DISABLED || !reflect.DeepEqual(meta.GetConfig(), expected.Config) {
-				return errors.New("pending reused-Create identity changed during membership recovery")
-			}
-		} else {
-			return errors.New("task phase cannot rebind membership")
-		}
-		return txn.Save(keypath.KeyspaceResetPath(expected.KeyspaceID), value)
+		return nil
 	})
-	if err != nil {
-		return err
-	}
-	manager.cacheReuseTask(&updated)
-	manager.notifyReuseTask(&updated)
-	return nil
 }
-
-func (manager *Manager) authorizeReclaim(expected *reuseTask, region *core.RegionInfo) {
-	if region.GetRegionEpoch().GetVersion() != expected.RegionVersion {
-		return
-	}
-	generation, restoreVersion, err := manager.currentAppliedState(expected, region)
-	if err != nil || generation != expected.ExpectedGeneration || restoreVersion < expected.ExpectedRestoreVersion ||
-		generation == ^uint64(0) || restoreVersion == ^uint64(0) {
-		return
-	}
-	updated := *expected
-	updated.Phase = keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_RECLAIM
-	updated.ExpectedRestoreVersion = restoreVersion
-	updated.Generation = generation + 1
-	updated.RestoreVersion = restoreVersion + 1
-	updated.RegionVersion = region.GetRegionEpoch().GetVersion()
-	updated.ConfVer = region.GetRegionEpoch().GetConfVer()
-	value, err := marshalReuseTask(&updated)
+func (manager *Manager) changeFreeBit(txn kv.Txn, id uint32, free bool) error {
+	layout, err := txn.Load(keyspaceBitmapLayoutPath())
 	if err != nil {
-		return
+		return err
 	}
-	err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		current, currentValue, err := manager.loadReuseTask(txn, expected.KeyspaceID)
-		if err != nil {
-			return err
-		}
-		expectedValue, err := marshalReuseTask(expected)
-		if err != nil || current == nil || currentValue != expectedValue {
-			return errors.New("keyspace reclaim preparation changed")
-		}
-		meta, err := manager.store.LoadKeyspaceMeta(txn, expected.KeyspaceID)
-		if err != nil {
-			return err
-		}
-		if meta == nil || meta.GetName() != expected.Name || meta.GetState() != keyspacepb.KeyspaceState_TOMBSTONE ||
-			meta.GetStateChangedAt() != expected.TombstoneChangedAt || meta.GetGeneration() != generation ||
-			meta.GetRestoreVersion() > restoreVersion {
-			return errors.New("tombstone identity or lineage changed during reclaim preparation")
-		}
-		return txn.Save(keypath.KeyspaceResetPath(expected.KeyspaceID), value)
-	})
-	if err == nil {
-		manager.cacheReuseTask(&updated)
-		manager.notifyReuseTask(&updated)
+	if layout != fmt.Sprintf("v1:%d", manager.bitmapBytes()) {
+		return errors.New("free bitmap layout changed")
 	}
+	width := manager.bitmapBytes()
+	bucket := id / uint32(width*8)
+	bit := id % uint32(width*8)
+	path := bitmapPath(bucket)
+	value, err := txn.Load(path)
+	if err != nil {
+		return err
+	}
+	bits := make([]byte, width)
+	if value != "" {
+		if len(value) != width {
+			return errors.New("invalid free bitmap bucket")
+		}
+		copy(bits, value)
+	}
+	mask := byte(1 << uint(bit%8))
+	present := bits[bit/8]&mask != 0
+	if present == free {
+		return errs.ErrEtcdTxnConflict
+	}
+	if free {
+		bits[bit/8] |= mask
+	} else {
+		bits[bit/8] &= ^mask
+	}
+	if bytes.Equal(bits, make([]byte, width)) {
+		return txn.Remove(path)
+	}
+	return txn.Save(path, string(bits))
 }
-
-// RequestKeyspaceReclaim is the explicit Cleaner-facing admission operation.
-// It persists a notification-only preparation task before collecting peer state.
-func (manager *Manager) RequestKeyspaceReclaim(id uint32) error {
-	manager.reuse.reclaimMu.Lock()
-	defer manager.reuse.reclaimMu.Unlock()
-	if existing := manager.currentTask(id); existing != nil {
-		if existing.Phase == keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_PREPARE_RECLAIM ||
-			existing.Phase == keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_RECLAIM {
-			manager.notifyReuseTask(existing)
-			return nil
-		}
-		return errors.New("keyspace has another active reuse task")
-	}
-	if isProtectedKeyspaceID(id) {
-		return newModifyProtectedKeyspaceError()
-	}
-	manager.reuse.mu.RLock()
-	for _, task := range manager.reuse.tasks {
-		if task.Phase == keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_PREPARE_RECLAIM ||
-			task.Phase == keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_RECLAIM {
-			manager.reuse.mu.RUnlock()
-			return errors.New("another keyspace reclamation is already active")
-		}
-	}
-	manager.reuse.mu.RUnlock()
-	region, err := manager.exactKeyspaceRegion(id)
-	if err != nil {
-		return err
-	}
-	if err := manager.reuseAdmissionReady(region); err != nil {
-		return err
-	}
-	if err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		meta, err := manager.store.LoadKeyspaceMeta(txn, id)
-		if err != nil {
-			return err
-		}
-		return manager.validateReclaimMeta(id, meta)
-	}); err != nil {
-		return err
-	}
-	if labeler := manager.cluster.GetRegionLabeler(); labeler != nil {
-		if err := labeler.SetLabelRule(buildLabelRule(id, txnRegionBound)); err != nil {
-			return err
-		}
-	}
-	var task *reuseTask
-	err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		meta, err := manager.store.LoadKeyspaceMeta(txn, id)
-		if err != nil {
-			return err
-		}
-		if err := manager.validateReclaimMeta(id, meta); err != nil {
-			return err
-		}
-		if existing, _, err := manager.loadReuseTask(txn, id); err != nil || existing != nil {
-			return err
-		}
-		task = &reuseTask{
-			Phase:                  keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_PREPARE_RECLAIM,
-			KeyspaceID:             id,
-			Name:                   meta.GetName(),
-			TombstoneChangedAt:     meta.GetStateChangedAt(),
-			ExpectedGeneration:     meta.GetGeneration(),
-			ExpectedRestoreVersion: meta.GetRestoreVersion(),
-			RegionID:               region.GetID(),
-			RegionVersion:          region.GetRegionEpoch().GetVersion(),
-			ConfVer:                region.GetRegionEpoch().GetConfVer(),
-		}
-		value, err := marshalReuseTask(task)
-		if err != nil {
-			return err
-		}
-		return txn.Save(keypath.KeyspaceResetPath(id), value)
-	})
-	if err != nil {
-		return err
-	}
-	manager.cacheReuseTask(task)
-	manager.notifyReuseTask(task)
-	return nil
-}
-
-func (manager *Manager) finishReclaim(expected *reuseTask) error {
-	manager.metaLock.Lock(expected.KeyspaceID)
-	defer manager.metaLock.Unlock(expected.KeyspaceID)
+func (manager *Manager) releaseReclaimedID(expected *keyspacepb.KeyspaceMeta) error {
+	manager.metaLock.Lock(expected.GetId())
+	defer manager.metaLock.Unlock(expected.GetId())
 	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		current, value, err := manager.loadReuseTask(txn, expected.KeyspaceID)
+		meta, err := manager.store.LoadKeyspaceMeta(txn, expected.GetId())
 		if err != nil {
 			return err
 		}
-		expectedValue, err := marshalReuseTask(expected)
-		if err != nil || current == nil || value != expectedValue {
-			return errors.New("keyspace reclaim task changed")
+		if meta == nil || meta.State != keyspacepb.KeyspaceState_RECLAIMED || meta.StateChangedAt != expected.StateChangedAt {
+			return errors.New("reclaimed state changed")
 		}
-		meta, err := manager.store.LoadKeyspaceMeta(txn, expected.KeyspaceID)
-		if err != nil {
-			return err
-		}
-		if meta == nil || meta.GetName() != expected.Name || meta.GetState() != keyspacepb.KeyspaceState_TOMBSTONE ||
-			meta.GetStateChangedAt() != expected.TombstoneChangedAt || meta.GetGeneration() != expected.ExpectedGeneration ||
-			meta.GetRestoreVersion() > expected.ExpectedRestoreVersion {
-			return errors.New("tombstone identity changed during keyspace reclaim")
-		}
-		if free, err := txn.Load(keypath.KeyspaceFreePath(expected.KeyspaceID)); err != nil || free != "" {
-			if err != nil {
-				return err
-			}
-			return errors.New("free keyspace record already exists")
-		}
-		if err := manager.store.RemoveKeyspace(txn, expected.KeyspaceID, expected.Name); err != nil {
-			return err
+		if manager.reuse.now().Sub(time.Unix(meta.StateChangedAt, 0)) < manager.reuse.retention {
+			return errors.New("reuse delay has not elapsed")
 		}
 		if err := manager.unassignKeyspaceFromMetaServiceGroup(txn, meta); err != nil {
 			return err
 		}
-		if err := txn.Remove(keypath.KeyspaceResetPath(expected.KeyspaceID)); err != nil {
+		if err := manager.store.RemoveKeyspace(txn, meta.GetId(), meta.Name); err != nil {
 			return err
 		}
-		return txn.Save(keypath.KeyspaceFreePath(expected.KeyspaceID), encodeFreeID(expected.Generation, expected.RestoreVersion))
+		return manager.changeFreeBit(txn, meta.GetId(), true)
 	})
-	if err != nil {
-		return err
+	if err == nil {
+		manager.reuse.mu.Lock()
+		delete(manager.reuse.pending, expected.GetId())
+		if item := manager.reuse.workItems[expected.GetId()]; item != nil {
+			manager.reuse.workQueue.Remove(item)
+			delete(manager.reuse.workItems, expected.GetId())
+		}
+		manager.reuse.mu.Unlock()
+		manager.unindexReuseRegion(expected.GetId())
+		manager.keyspaceNameLookup.Delete(expected.GetId())
+		manager.keyspaceStateLookup.Delete(expected.GetId())
 	}
-	manager.removeCachedReuseTask(expected.KeyspaceID)
-	manager.keyspaceNameLookup.Delete(expected.KeyspaceID)
-	manager.keyspaceStateLookup.Delete(expected.KeyspaceID)
-	return nil
+	return err
 }
-
 func (manager *Manager) reserveMetaServiceGroup(config map[string]string) (map[string]string, string, error) {
 	config = cloneKeyspaceConfig(config)
 	if manager.mgm == nil || len(manager.mgm.GetGroups()) == 0 {
@@ -895,60 +680,30 @@ func (manager *Manager) reserveMetaServiceGroup(config map[string]string) (map[s
 	return config, groupID, nil
 }
 
-func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]string, createTime int64) (*keyspacepb.KeyspaceMeta, *reuseTask, error) {
-	var existingMeta *keyspacepb.KeyspaceMeta
-	var existingTask *reuseTask
+func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]string, createTime int64) (*keyspacepb.KeyspaceMeta, *keyspacepb.KeyspaceMeta, error) {
+	var existing *keyspacepb.KeyspaceMeta
 	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		exists, id, err := manager.store.LoadKeyspaceID(txn, name)
-		if err != nil || !exists {
+		found, id, err := manager.store.LoadKeyspaceID(txn, name)
+		if err != nil || !found {
 			return err
 		}
-		existingMeta, err = manager.store.LoadKeyspaceMeta(txn, id)
-		if err != nil {
-			return err
-		}
-		existingTask, _, err = manager.loadReuseTask(txn, id)
+		existing, err = manager.store.LoadKeyspaceMeta(txn, id)
 		return err
 	})
 	if err != nil {
 		return nil, nil, err
 	}
-	if existingMeta != nil {
-		if existingTask != nil && existingTask.Phase == keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_VALIDATE_REUSE &&
-			((existingMeta.GetState() == keyspacepb.KeyspaceState_DISABLED &&
-				existingMeta.GetRestoreVersion() == existingTask.ExpectedRestoreVersion) ||
-				(existingMeta.GetState() == keyspacepb.KeyspaceState_ENABLED &&
-					existingMeta.GetRestoreVersion() == existingTask.RestoreVersion)) &&
-			existingMeta.GetGeneration() == existingTask.Generation &&
-			reflect.DeepEqual(configForRetry(existingMeta.GetConfig()), configForRetry(config)) {
-			manager.cacheReuseTask(existingTask)
-			return existingMeta, existingTask, nil
-		}
-		if existingTask == nil && existingMeta.GetState() == keyspacepb.KeyspaceState_ENABLED &&
-			existingMeta.GetGeneration() != 0 && existingMeta.GetRestoreVersion() != 0 &&
-			isKeyspaceEncrypted(existingMeta.GetConfig()) &&
-			reflect.DeepEqual(configForRetry(existingMeta.GetConfig()), configForRetry(config)) {
-			return existingMeta, nil, nil
+	if existing != nil {
+		if existing.State == keyspacepb.KeyspaceState_CREATING && reflect.DeepEqual(configForRetry(existing.Config), configForRetry(config)) {
+			manager.cacheReuseMeta(existing)
+			return existing, existing, nil
 		}
 		return nil, nil, errs.ErrKeyspaceExists
 	}
-	// The first end-to-end prototype reuses only CMEK keyspaces. Plaintext
-	// creates keep the established allocator path instead of silently bypassing
-	// the encryption-readiness contract.
-	if !manager.config.IsIDReuseEnabled() || !isKeyspaceEncrypted(config) {
+	if !manager.config.IsIDReuseEnabled() || !manager.transactionalReuseConfig(config) || (isKeyspaceEncrypted(config) && !manager.config.IsEncryptedIDReuseEnabled()) {
 		return nil, nil, nil
 	}
-	if err := manager.rejectIndependentScheduling(); err != nil {
-		return nil, nil, err
-	}
-	prefix := keypath.KeyspaceFreePrefix()
-	var keys, values []string
-	err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		var err error
-		keys, values, err = txn.LoadRange(prefix, clientv3.GetPrefixRangeEnd(prefix), freeIDScanLimit)
-		return err
-	})
-	if err != nil || len(keys) == 0 {
+	if err := manager.ensureBitmapLayout(); err != nil {
 		return nil, nil, err
 	}
 	config, groupID, err := manager.reserveMetaServiceGroup(config)
@@ -961,244 +716,109 @@ func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]s
 			manager.rollbackMetaServiceGroupAssignment(groupID)
 		}
 	}()
-	for index, key := range keys {
-		id, parseErr := freeIDFromPath(key)
-		generation, restoreVersion, decodeErr := decodeFreeID(values[index])
-		if parseErr != nil || decodeErr != nil {
-			continue
-		}
-		region, regionErr := manager.exactKeyspaceRegion(id)
-		if regionErr != nil || generation == ^uint64(0) || restoreVersion == ^uint64(0) {
-			continue
-		}
-		if manager.reuseAdmissionReady(region) != nil {
-			continue
-		}
-		meta := &keyspacepb.KeyspaceMeta{
-			Keyspace:       &keyspacepb.KeyspaceMeta_Id{Id: id},
-			Name:           name,
-			State:          keyspacepb.KeyspaceState_DISABLED,
-			CreatedAt:      createTime,
-			StateChangedAt: createTime,
-			Config:         cloneKeyspaceConfig(config),
-			Generation:     generation,
-			RestoreVersion: restoreVersion,
-		}
-		task := &reuseTask{
-			Phase:                  keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_VALIDATE_REUSE,
-			KeyspaceID:             id,
-			Name:                   name,
-			Config:                 cloneKeyspaceConfig(config),
-			ExpectedGeneration:     generation,
-			Generation:             generation,
-			ExpectedRestoreVersion: restoreVersion,
-			RestoreVersion:         restoreVersion + 1,
-			RegionID:               region.GetID(),
-			RegionVersion:          region.GetRegionEpoch().GetVersion(),
-			ConfVer:                region.GetRegionEpoch().GetConfVer(),
-		}
-		value, err := marshalReuseTask(task)
-		if err != nil {
-			return nil, nil, err
-		}
+	for attempt := 0; attempt < 16; attempt++ {
+		var meta *keyspacepb.KeyspaceMeta
 		err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-			free, err := txn.Load(key)
-			if err != nil || free != values[index] {
-				return errors.New("free keyspace candidate changed")
-			}
-			exists, _, err := manager.store.LoadKeyspaceID(txn, name)
-			if err != nil || exists {
-				if exists {
-					return errs.ErrKeyspaceExists
-				}
-				return err
-			}
-			oldMeta, err := manager.store.LoadKeyspaceMeta(txn, id)
-			if err != nil || oldMeta != nil {
-				return errors.New("free keyspace candidate still has metadata")
-			}
-			if err := manager.store.SaveKeyspaceID(txn, id, name); err != nil {
-				return err
-			}
-			if err := manager.store.SaveKeyspaceMeta(txn, meta); err != nil {
-				return err
-			}
-			if err := txn.Save(keypath.KeyspaceResetPath(id), value); err != nil {
-				return err
-			}
-			return txn.Remove(key)
-		})
-		if err != nil {
-			if errors.ErrorEqual(err, errs.ErrKeyspaceExists) {
-				return manager.tryCreateReusedKeyspace(name, config, createTime)
-			}
-			continue
-		}
-		claimed = true
-		manager.cacheReuseTask(task)
-		manager.keyspaceNameLookup.Store(id, name)
-		manager.keyspaceStateLookup.Store(id, keyspacepb.KeyspaceState_DISABLED)
-		manager.notifyReuseTask(task)
-		return meta, task, nil
-	}
-	return nil, nil, nil
-}
-
-// SelectKeyspaceEncryptionMetaFile performs the single-winner CAS for a CSE
-// candidate. Losing candidates remain unused and callers receive the durable
-// selected file ID.
-func (manager *Manager) SelectKeyspaceEncryptionMetaFile(
-	id uint32,
-	generation, restoreVersion, candidate uint64,
-) (uint64, error) {
-	if candidate == 0 {
-		return 0, errors.New("encryption metadata candidate file ID must be non-zero")
-	}
-	var selected uint64
-	var updated *reuseTask
-	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		task, _, err := manager.loadReuseTask(txn, id)
-		if err != nil {
-			return err
-		}
-		if task == nil || task.Phase != keyspacepb.KeyspaceTaskPhase_KEYSPACE_TASK_VALIDATE_REUSE ||
-			task.Generation != generation || task.RestoreVersion != restoreVersion {
-			return errors.New("no matching pending reused-keyspace Create")
-		}
-		meta, err := manager.store.LoadKeyspaceMeta(txn, id)
-		if err != nil {
-			return err
-		}
-		if meta == nil || meta.GetState() != keyspacepb.KeyspaceState_DISABLED ||
-			meta.GetName() != task.Name || !reflect.DeepEqual(meta.GetConfig(), task.Config) ||
-			meta.GetGeneration() != generation || meta.GetRestoreVersion() != task.ExpectedRestoreVersion {
-			return errors.New("pending reused-keyspace Create identity changed")
-		}
-		if task.EncryptionMetaFileID != 0 {
-			selected = task.EncryptionMetaFileID
-			return nil
-		}
-		task.EncryptionMetaFileID = candidate
-		value, err := marshalReuseTask(task)
-		if err != nil {
-			return err
-		}
-		if err := txn.Save(keypath.KeyspaceResetPath(id), value); err != nil {
-			return err
-		}
-		selected = candidate
-		updated = task
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	if updated != nil {
-		manager.cacheReuseTask(updated)
-		manager.notifyReuseTask(updated)
-	}
-	return selected, nil
-}
-
-func (manager *Manager) finishReusedCreate(expected *reuseTask) error {
-	manager.metaLock.Lock(expected.KeyspaceID)
-	defer manager.metaLock.Unlock(expected.KeyspaceID)
-	alreadyFinished := false
-	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		current, value, err := manager.loadReuseTask(txn, expected.KeyspaceID)
-		if err != nil {
-			return err
-		}
-		expectedValue, err := marshalReuseTask(expected)
-		if err != nil {
-			return err
-		}
-		if current == nil {
-			meta, err := manager.store.LoadKeyspaceMeta(txn, expected.KeyspaceID)
+			keys, values, err := txn.LoadRange(bitmapPrefix(), clientv3.GetPrefixRangeEnd(bitmapPrefix()), freeIDScanLimit)
 			if err != nil {
 				return err
 			}
-			if meta != nil && meta.GetName() == expected.Name && meta.GetState() == keyspacepb.KeyspaceState_ENABLED &&
-				meta.GetGeneration() == expected.Generation && meta.GetRestoreVersion() == expected.RestoreVersion {
-				alreadyFinished = true
-				return nil
+			for index, key := range keys {
+				bucket, err := strconv.ParseUint(key[len(bitmapPrefix()):], 10, 32)
+				if err != nil || len(values[index]) != manager.bitmapBytes() {
+					return errors.New("invalid free bitmap encoding")
+				}
+				for offset, bits := range []byte(values[index]) {
+					for bit := uint32(0); bit < 8; bit++ {
+						if bits&(1<<bit) == 0 {
+							continue
+						}
+						id := uint32(bucket)*uint32(manager.bitmapBytes()*8) + uint32(offset*8) + bit
+						if !reusableKeyspaceID(id) {
+							return errors.New("protected ID in free bitmap")
+						}
+						region := manager.coveringKeyspaceRegion(id)
+						if region == nil || manager.reuseAdmissionReady(region) != nil {
+							continue
+						}
+						exists, _, err := manager.store.LoadKeyspaceID(txn, name)
+						if err != nil {
+							return err
+						}
+						if exists {
+							return errs.ErrKeyspaceExists
+						}
+						old, err := manager.store.LoadKeyspaceMeta(txn, id)
+						if err != nil {
+							return err
+						}
+						if old != nil {
+							return errs.ErrEtcdTxnConflict
+						}
+						meta = &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: name, Config: cloneKeyspaceConfig(config), State: keyspacepb.KeyspaceState_CREATING, CreatedAt: createTime, StateChangedAt: createTime}
+						if err := manager.changeFreeBit(txn, id, false); err != nil {
+							return err
+						}
+						if err := manager.store.SaveKeyspaceID(txn, id, name); err != nil {
+							return err
+						}
+						return manager.store.SaveKeyspaceMeta(txn, meta)
+					}
+				}
 			}
-			return errors.New("reused keyspace create task is no longer active")
-		}
-		if value != expectedValue {
-			return errors.New("reused keyspace create task changed")
-		}
-		meta, err := manager.store.LoadKeyspaceMeta(txn, expected.KeyspaceID)
+			return nil
+		})
 		if err != nil {
-			return err
-		}
-		if meta == nil || meta.GetName() != expected.Name ||
-			(meta.GetState() != keyspacepb.KeyspaceState_DISABLED && meta.GetState() != keyspacepb.KeyspaceState_ENABLED) ||
-			!reflect.DeepEqual(meta.GetConfig(), expected.Config) || meta.GetGeneration() != expected.Generation {
-			return errors.New("reused keyspace identity or lineage changed")
-		}
-		if meta.GetState() == keyspacepb.KeyspaceState_DISABLED {
-			if meta.GetRestoreVersion() != expected.ExpectedRestoreVersion {
-				return errors.New("pending reused-keyspace Restore version changed")
+			if errors.ErrorEqual(err, errs.ErrKeyspaceExists) {
+				return nil, nil, err
 			}
-			meta.State = keyspacepb.KeyspaceState_ENABLED
-			meta.StateChangedAt = manager.reuse.now().Unix()
-			meta.RestoreVersion = expected.RestoreVersion
-			return manager.store.SaveKeyspaceMeta(txn, meta)
+			if errors.ErrorEqual(err, errs.ErrEtcdTxnConflict) {
+				continue
+			}
+			return nil, nil, err
 		}
-		if meta.GetRestoreVersion() != expected.RestoreVersion {
-			return errors.New("completed reused-keyspace Restore version changed")
+		if meta == nil {
+			return nil, nil, nil
 		}
-		return nil
-	})
-	if err != nil {
-		return err
+		claimed = true
+		manager.cacheReuseMeta(meta)
+		manager.keyspaceNameLookup.Store(meta.GetId(), name)
+		manager.reuse.mu.Lock()
+		if region := manager.coveringKeyspaceRegion(meta.GetId()); region != nil {
+			delete(manager.reuse.reports, region.GetID())
+		}
+		manager.reuse.mu.Unlock()
+		if err := manager.splitKeyspaceRegion(meta.GetId(), false, txnRegionBound); err != nil {
+			return nil, nil, err
+		}
+		manager.advanceReuseTask(meta.GetId())
+		return meta, meta, nil
 	}
-	if alreadyFinished {
-		manager.removeCachedReuseTask(expected.KeyspaceID)
-		return nil
-	}
-	if manager.kgm != nil {
-		userKind := endpoint.StringUserKind(expected.Config[UserKindKey])
-		if err := manager.kgm.UpdateKeyspaceForGroup(userKind, expected.Config[TSOKeyspaceGroupIDKey], expected.KeyspaceID, opAdd); err != nil {
-			return err
-		}
-	}
-	err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		current, value, err := manager.loadReuseTask(txn, expected.KeyspaceID)
-		if err != nil {
-			return err
-		}
-		expectedValue, err := marshalReuseTask(expected)
-		if err != nil || current == nil || value != expectedValue {
-			return errors.New("reused keyspace create task changed before completion")
-		}
-		return txn.Remove(keypath.KeyspaceResetPath(expected.KeyspaceID))
-	})
-	if err != nil {
-		return err
-	}
-	manager.removeCachedReuseTask(expected.KeyspaceID)
-	manager.keyspaceStateLookup.Store(expected.KeyspaceID, keyspacepb.KeyspaceState_ENABLED)
-	return nil
+	return nil, nil, errors.New("free bitmap remained contended")
 }
-
-func (manager *Manager) waitReusedCreate(task *reuseTask) (*keyspacepb.KeyspaceMeta, error) {
+func (manager *Manager) waitReusedCreate(meta *keyspacepb.KeyspaceMeta) (*keyspacepb.KeyspaceMeta, error) {
 	ticker := time.NewTicker(manager.config.GetCheckRegionSplitInterval())
-	timer := time.NewTimer(manager.config.GetWaitRegionSplitTimeout())
 	defer ticker.Stop()
+	timer := time.NewTimer(manager.config.GetWaitRegionSplitTimeout())
 	defer timer.Stop()
 	for {
-		if manager.currentTask(task.KeyspaceID) == nil {
-			return manager.LoadKeyspaceByID(task.KeyspaceID)
+		current, err := manager.LoadKeyspaceByID(meta.GetId())
+		if err != nil {
+			return nil, err
+		}
+		if current.Name != meta.Name {
+			return nil, errors.New("pending creation identity changed")
+		}
+		if current.State == keyspacepb.KeyspaceState_ENABLED {
+			return current, nil
 		}
 		select {
 		case <-manager.ctx.Done():
-			return nil, errors.New("waiting for reused keyspace validation was canceled")
-		case <-ticker.C:
-			manager.advanceReuseTask(task.KeyspaceID)
+			return nil, errors.New("pending reused creation canceled")
 		case <-timer.C:
-			return nil, errors.New("timed out waiting for current peers to validate the reused keyspace")
+			return nil, errors.New("reused creation is still pending; retry with the same name and configuration")
+		case <-ticker.C:
+			manager.advanceReuseTask(meta.GetId())
 		}
 	}
 }

@@ -1228,3 +1228,6 @@ func (suite *keyspaceTestSuite) TestTombstoneKeyspaceUnassignsMetaServiceGroup()
 	re.NoError(err)
 	re.Equal(0, counts[groupID])
 }
+
+func (m *mockConfig) GetIDReuseBucketBytes() int      { return 32 }
+func (m *mockConfig) IsEncryptedIDReuseEnabled() bool { return true }

@@ -1010,9 +1010,7 @@ func (s *GrpcServer) StoreHeartbeat(ctx context.Context, request *pdpb.StoreHear
 	resp.ClusterVersion = rc.GetClusterVersion()
 	rc.GetUnsafeRecoveryController().HandleStoreHeartbeat(request, resp)
 	stats := request.GetStats()
-	s.GetKeyspaceManager().RecordKeyspaceStateStatuses(
-		stats.GetStoreId(), stats.GetKeyspaceIdReuseCapable(), stats.GetKeyspaceStateStatuses())
-	resp.KeyspaceStateRequests = s.GetKeyspaceManager().KeyspaceStateRequests(stats.GetStoreId())
+	s.GetKeyspaceManager().RecordIDReuseCapability(stats.GetStoreId(), stats.GetKeyspaceIdReuseProtocolVersion())
 
 	return resp, nil
 }
@@ -1429,8 +1427,9 @@ func (s *GrpcServer) RegionHeartbeat(stream pdpb.PD_RegionHeartbeatServer) error
 		}
 		regionHeartbeatHandleDuration.WithLabelValues(storeAddress, storeLabel).Observe(time.Since(start).Seconds())
 		regionHeartbeatCounter.WithLabelValues(storeAddress, storeLabel, "report", "ok").Inc()
+		s.GetKeyspaceManager().RecordRegionStorageState(region, request.GetStorageState())
 		if s.GetKeyspaceManager().KeyspaceUpdateRequiredForRegion(region.GetID()) {
-			s.hbStreams.SendMsg(region, &hbstream.Operation{KeyspaceUpdateRequired: true})
+			s.hbStreams.SendMsg(region, &hbstream.Operation{RegionRequiresUpdate: true})
 		}
 
 		if rc.IsServiceIndependent(constant.SchedulingServiceName) {
