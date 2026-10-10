@@ -1231,3 +1231,5 @@ func (suite *keyspaceTestSuite) TestTombstoneKeyspaceUnassignsMetaServiceGroup()
 
 func (m *mockConfig) GetIDReuseBucketBytes() int      { return 32 }
 func (m *mockConfig) IsEncryptedIDReuseEnabled() bool { return true }
+
+func (m *mockConfig) GetIDReuseMergeDelay() time.Duration { return 3 * 24 * time.Hour }

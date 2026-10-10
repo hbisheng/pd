@@ -82,6 +82,7 @@ type Config interface {
 	IsIDReuseEnabled() bool
 	GetIDReuseThreshold() uint64
 	GetIDReuseWorkerInterval() time.Duration
+	GetIDReuseMergeDelay() time.Duration
 	GetIDReuseBucketBytes() int
 	IsEncryptedIDReuseEnabled() bool
 	// GetMetaServiceGroups returns the meta-service groups for keyspace assignment.
@@ -302,7 +303,7 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 	}
 	tracer.OnGetConfigFinished()
 
-	// Reused Create waits for applied state; all destructive cleanup preceded the claim.
+	// Reused Create either follows split initialization or waits for a fixed reset.
 	reused, task, err := manager.tryCreateReusedKeyspace(request.Name, request.Config, request.CreateTime)
 	if err != nil {
 		return nil, err
@@ -800,9 +801,6 @@ func (manager *Manager) LoadKeyspace(name string) (*keyspacepb.KeyspaceMeta, err
 		if meta == nil {
 			return errs.ErrKeyspaceNotFound
 		}
-		if meta.State == keyspacepb.KeyspaceState_CREATING {
-			return errs.ErrKeyspaceNotFound
-		}
 		return nil
 	})
 	if manager.mgm != nil && meta != nil {
@@ -948,6 +946,9 @@ func (manager *Manager) updateKeyspaceConfigTxn(name string, update func(meta *k
 		if meta == nil {
 			return errs.ErrKeyspaceNotFound
 		}
+		if isReusePending(meta) {
+			return errors.New("cannot change configuration during a pending keyspace reset")
+		}
 		// Only keyspace with state listed in allowChangeConfig are allowed to change their config.
 		if !slice.Contains(allowChangeConfig, meta.GetState()) {
 			return errors.Errorf("cannot change config for keyspace with state %s", meta.GetState().String())
@@ -1065,6 +1066,7 @@ func (manager *Manager) UpdateKeyspaceState(name string, newState keyspacepb.Key
 	if manager.mgm != nil {
 		manager.mgm.AttachEndpoints(meta.GetConfig())
 	}
+	manager.cacheReuseMeta(meta)
 	log.Info("[keyspace] keyspace state updated",
 		zap.Uint32("id", meta.GetId()),
 		zap.String("keyspace-id", meta.GetName()),
@@ -1137,6 +1139,7 @@ func (manager *Manager) UpdateKeyspaceStateByID(id uint32, newState keyspacepb.K
 		)
 		return nil, err
 	}
+	manager.cacheReuseMeta(meta)
 	log.Info("[keyspace] keyspace state updated",
 		zap.Uint32("keyspace-id", meta.GetId()),
 		zap.String("name", meta.GetName()),
@@ -1176,8 +1179,11 @@ func (manager *Manager) unassignKeyspaceFromMetaServiceGroup(txn kv.Txn, meta *k
 
 // transformKeyspaceState transforms the keyspace state to the target state and record the update time.
 func (manager *Manager) transformKeyspaceState(txn kv.Txn, meta *keyspacepb.KeyspaceMeta, newState keyspacepb.KeyspaceState, now int64) error {
-	if isReusePending(meta.State) || isReusePending(newState) {
-		return errors.New("reuse lifecycle is managed internally")
+	if isReusePending(meta) && newState == keyspacepb.KeyspaceState_ENABLED {
+		return errors.New("reused keyspace reset has not completed")
+	}
+	if newState == keyspacepb.KeyspaceState_ARCHIVED {
+		meta.PendingResetVersion = 0
 	}
 	// If already in the target state, do nothing and return. A TOMBSTONE keyspace
 	// still carrying a meta-service group binding (e.g. one tombstoned before this

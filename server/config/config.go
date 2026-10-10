@@ -892,7 +892,9 @@ type KeyspaceConfig struct {
 	// IDReuseThreshold is the minimum reserved allocator-window end at which
 	// new reclamation requests are admitted.
 	IDReuseThreshold uint64 `toml:"id-reuse-threshold" json:"id-reuse-threshold"`
-	// IDReuseWorkerInterval bounds durable task notification and advancement.
+	// IDReuseMergeDelay allows tombstoned Regions time to merge before releasing IDs.
+	IDReuseMergeDelay typeutil.Duration `toml:"id-reuse-merge-delay" json:"id-reuse-merge-delay"`
+	// IDReuseWorkerInterval bounds pending reset notification and advancement.
 	IDReuseWorkerInterval typeutil.Duration `toml:"id-reuse-worker-interval" json:"id-reuse-worker-interval"`
 	// MetaServiceGroups is the available external meta-service groups.
 	// The key is the meta-service group name, and the value is the corresponding endpoint.
@@ -910,6 +912,9 @@ func (c *KeyspaceConfig) Validate() error {
 	}
 	if c.CheckRegionSplitInterval.Duration >= c.WaitRegionSplitTimeout.Duration {
 		return errors.New("[keyspace] check-region-split-interval should be less than wait-region-split-timeout")
+	}
+	if c.IDReuseMergeDelay.Duration < 0 {
+		return errors.New("id-reuse-merge-delay cannot be negative")
 	}
 	if c.IDReuseWorkerInterval.Duration <= 0 {
 		return errors.New("[keyspace] id-reuse-worker-interval must be positive")
@@ -932,6 +937,10 @@ func (c *KeyspaceConfig) adjust(meta *configutil.ConfigMetaData) error {
 	}
 	if !meta.IsDefined("id-reuse-worker-interval") {
 		c.IDReuseWorkerInterval = typeutil.NewDuration(defaultKeyspaceIDReuseInterval)
+	}
+
+	if !meta.IsDefined("id-reuse-merge-delay") {
+		c.IDReuseMergeDelay = typeutil.NewDuration(3 * 24 * time.Hour)
 	}
 
 	return AdjustMetaServiceGroups(c.MetaServiceGroups)
@@ -1048,5 +1057,8 @@ func (c *KeyspaceConfig) GetIDReuseBucketBytes() int {
 	return c.IDReuseBucketBytes
 }
 
-// IsEncryptedIDReuseEnabled enables the follow-up encrypted reuse path.
+// GetIDReuseMergeDelay returns the wait after TOMBSTONE, before ID release.
+func (c *KeyspaceConfig) GetIDReuseMergeDelay() time.Duration { return c.IDReuseMergeDelay.Duration }
+
+// IsEncryptedIDReuseEnabled enables legacy encryption reuse in the POC.
 func (c *KeyspaceConfig) IsEncryptedIDReuseEnabled() bool { return c.EnableEncryptedIDReuse }

@@ -564,6 +564,13 @@ func (s *Server) startServer(ctx context.Context) error {
 	}
 	s.gcStateManager = gc.NewGCStateManager(s.storage.GetGCStateProvider(), s.cfg.PDServerCfg, s.keyspaceManager)
 	s.hbStreams = hbstream.NewHeartbeatStreams(ctx, "", s.cluster)
+	s.keyspaceManager.SetResetVersionAllocator(func(ctx context.Context) (uint64, error) {
+		ts, err := (&GrpcServer{Server: s}).getGlobalTSO(ctx)
+		if err != nil {
+			return 0, err
+		}
+		return tsoutil.GenerateTS(&ts), nil
+	})
 	s.keyspaceManager.SetKeyspaceUpdateNotifier(func(region *core.RegionInfo) {
 		s.hbStreams.SendMsg(region, &hbstream.Operation{RegionRequiresUpdate: true})
 	})

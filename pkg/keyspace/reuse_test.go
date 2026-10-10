@@ -16,6 +16,7 @@ package keyspace
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/pd/pkg/core"
+	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/keyspace/constant"
 	"github.com/tikv/pd/pkg/mock/mockcluster"
 	"github.com/tikv/pd/pkg/mock/mockconfig"
@@ -55,15 +57,18 @@ func newReuseTestManagerWithKV(t *testing.T, backend kv.Base) (*endpoint.Storage
 	require.NoError(t, kgm.Bootstrap(ctx))
 	manager := NewKeyspaceManager(ctx, storage, cluster, allocator, &mockConfig{EnableIDReuse: true, IDReuseThreshold: 10, IDReuseWorkerInterval: typeutil.NewDuration(time.Hour), WaitRegionSplitTimeout: typeutil.NewDuration(100 * time.Millisecond), CheckRegionSplitInterval: typeutil.NewDuration(time.Millisecond)}, kgm, nil)
 	manager.reuse.now = func() time.Time { return time.Unix(4_000_000, 0) }
-	manager.RecordIDReuseCapability(1, 2)
+	manager.RecordIDReuseCapability(1, 3)
+	var version atomic.Uint64
+	version.Store(1_000_000)
+	manager.SetResetVersionAllocator(func(context.Context) (uint64, error) { return version.Add(1), nil })
 	require.NoError(t, manager.ensureBitmapLayout())
 	return storage, cluster, manager
 }
 func saveReuseTestMeta(t *testing.T, manager *Manager, id uint32, state keyspacepb.KeyspaceState) {
 	require.NoError(t, manager.saveNewKeyspace(&keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: state.String() + "-" + string(rune(id+'a')), State: state, Config: map[string]string{}, CreatedAt: 1, StateChangedAt: 2}))
 }
-func TestReclaimWaitStartsAfterAppliedCleanup(t *testing.T) {
-	storage, cluster, manager := newReuseTestManager(t)
+
+func prepareIsolatedReuse(t *testing.T, manager *Manager, cluster *mockcluster.Cluster) {
 	for id := uint32(41); id <= 43; id++ {
 		state := keyspacepb.KeyspaceState_ENABLED
 		if id == 42 {
@@ -72,62 +77,124 @@ func TestReclaimWaitStartsAfterAppliedCleanup(t *testing.T) {
 		saveReuseTestMeta(t, manager, id, state)
 		cluster.PutRegion(newReuseTestRegion(id, uint64(id)))
 	}
+}
+func TestReclaimReleasesIDWithoutResetAfterMergeDelay(t *testing.T) {
+	storage, cluster, manager := newReuseTestManager(t)
+	prepareIsolatedReuse(t, manager, cluster)
+	meta, _ := manager.LoadKeyspaceByID(42)
+	manager.reuse.now = func() time.Time { return time.Unix(meta.StateChangedAt, 0).Add(2 * 24 * time.Hour) }
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
-	require.True(t, manager.KeyspaceUpdateRequiredForRegion(42))
-	meta, err := manager.LoadKeyspaceByID(42)
+	_, err := manager.LoadKeyspaceByID(42)
 	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_RECLAIMING, meta.State)
-	region := cluster.GetRegion(42)
-	manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{ReclaimReady: true})
-	manager.advanceReuseTask(42)
-	meta, err = manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_RECLAIMED, meta.State)
-	require.Equal(t, manager.reuse.now().Unix(), meta.StateChangedAt)
+	require.False(t, manager.KeyspaceUpdateRequiredForRegion(42))
+	manager.reuse.now = func() time.Time { return time.Unix(meta.StateChangedAt, 0).Add(3 * 24 * time.Hour) }
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
-	again, _ := manager.LoadKeyspaceByID(42)
-	require.Equal(t, meta.StateChangedAt, again.StateChangedAt)
-	manager.reuse.now = func() time.Time { return time.Unix(meta.StateChangedAt, 0).Add(7 * 24 * time.Hour) }
-	manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{ReclaimReady: true})
-	manager.advanceReuseTask(42)
 	_, err = manager.LoadKeyspaceByID(42)
-	require.Error(t, err)
+	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
+	require.NoError(t, manager.RequestKeyspaceReclaim(42))
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		bits, e := txn.Load(bitmapPath(0))
-		require.Len(t, bits, 32)
 		require.NotZero(t, bits[42/8]&(1<<(42%8)))
 		return e
 	}))
-	created, pending, err := manager.tryCreateReusedKeyspace("new-tenant", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, manager.reuse.now().Unix())
-	require.NoError(t, err)
-	require.Equal(t, uint32(42), created.GetId())
-	require.NotNil(t, pending)
-	// A report from reclamation cannot complete the new creation.
-	manager.advanceReuseTask(42)
-	current, _ := manager.LoadKeyspaceByID(42)
-	require.Equal(t, keyspacepb.KeyspaceState_CREATING, current.State)
-	manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{ReclaimReady: true})
-	require.NotNil(t, manager.appliedStorageState(region))
-	manager.advanceReuseTask(42)
-	current, _ = manager.LoadKeyspaceByID(42)
-	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, current.State)
+	require.Empty(t, manager.reuse.pending)
 }
-func TestReclaimAcceptsMergeButWaitsForDeletedNeighbor(t *testing.T) {
+func TestReclaimWaitsForDeletedNeighborAndMultipleRegions(t *testing.T) {
 	_, cluster, manager := newReuseTestManager(t)
 	for id := uint32(41); id <= 43; id++ {
 		saveReuseTestMeta(t, manager, id, keyspacepb.KeyspaceState_TOMBSTONE)
 		cluster.PutRegion(newReuseTestRegion(id, uint64(id)))
 	}
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
+	_, err := manager.LoadKeyspaceByID(42)
+	require.NoError(t, err)
+	covering := cluster.GetRegion(42).Clone(core.WithStartKey(MakeRegionBound(41).TxnLeftBound))
+	cluster.PutRegion(covering)
+	require.NoError(t, manager.RequestKeyspaceReclaim(42))
+	_, err = manager.LoadKeyspaceByID(42)
+	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
+}
+func TestNoSplitCreateRequiresMatchingAppliedVersionAndAllowsArchive(t *testing.T) {
+	storage, cluster, manager := newReuseTestManager(t)
+	cluster.PutRegion(newReuseTestRegion(42, 42))
+	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
+	created, pending, err := manager.tryCreateReusedKeyspace("new-tenant", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, manager.reuse.now().Unix())
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	require.Equal(t, keyspacepb.KeyspaceState_DISABLED, created.State)
+	require.NotZero(t, created.PendingResetVersion)
+	target := created.PendingResetVersion
+	region := cluster.GetRegion(42)
+	manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{RestoreVersion: target - 1})
+	manager.advanceReuseTask(42)
+	current, _ := manager.LoadKeyspaceByID(42)
+	require.Equal(t, target, current.PendingResetVersion)
+	_, err = manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_ENABLED, 3)
+	require.Error(t, err)
+	// Timeout preserves the same claim; manager can query DISABLED and abandon it.
+	_, err = manager.waitReusedCreate(created)
+	require.Error(t, err)
+	current, _ = manager.LoadKeyspace("new-tenant")
+	require.Equal(t, target, current.PendingResetVersion)
+	_, _, err = manager.tryCreateReusedKeyspace("new-tenant", created.Config, 4)
+	require.ErrorIs(t, err, errs.ErrKeyspaceExists)
+	require.NoError(t, manager.StartIDReuse())
+	t.Cleanup(manager.StopIDReuse)
+	manager.RecordIDReuseCapability(1, 3)
+	manager.advanceReuseTask(42)
+	require.True(t, manager.KeyspaceUpdateRequiredForRegion(42))
+	_, err = manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_ARCHIVED, 5)
+	require.NoError(t, err)
+	manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{RestoreVersion: target})
+	manager.advanceReuseTask(42)
+	current, _ = manager.LoadKeyspaceByID(42)
+	require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, current.State)
+	require.Zero(t, current.PendingResetVersion)
 	require.False(t, manager.KeyspaceUpdateRequiredForRegion(42))
-	// Merge while reclaim is pending: boundaries establish completion, with no reset/report.
-	region := cluster.GetRegion(42).Clone(core.WithStartKey(MakeRegionBound(41).TxnLeftBound))
+}
+func TestAppliedResetEnablesSameOwnerAndClearsPendingVersion(t *testing.T) {
+	storage, cluster, manager := newReuseTestManager(t)
+	cluster.PutRegion(newReuseTestRegion(42, 42))
+	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
+	created, _, err := manager.tryCreateReusedKeyspace("ready-tenant", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, manager.reuse.now().Unix())
+	require.NoError(t, err)
+	old := cluster.GetRegion(42)
+	manager.RecordRegionStorageState(old, &pdpb.RegionStorageState{RestoreVersion: created.PendingResetVersion})
+	region := old.Clone(core.WithIncVersion())
 	cluster.PutRegion(region)
 	manager.advanceReuseTask(42)
-	meta, err := manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_RECLAIMED, meta.State)
+	current, _ := manager.LoadKeyspaceByID(42)
+	require.Equal(t, keyspacepb.KeyspaceState_DISABLED, current.State)
+	manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{RestoreVersion: created.PendingResetVersion})
+	// An ordinary heartbeat without the optional payload does not erase a report.
+	manager.RecordRegionStorageState(region, nil)
+	manager.advanceReuseTask(42)
+	current, _ = manager.LoadKeyspaceByID(42)
+	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, current.State)
+	require.Zero(t, current.PendingResetVersion)
+	require.False(t, manager.KeyspaceUpdateRequiredForRegion(42))
+	require.Error(t, manager.completeReusedCreate(created))
 }
+func TestSplitReuseDoesNotAllocateResetVersion(t *testing.T) {
+	storage, cluster, manager := newReuseTestManager(t)
+	larger := newReuseTestRegion(42, 42).Clone(core.WithStartKey(MakeRegionBound(41).TxnLeftBound), core.WithEndKey(MakeRegionBound(43).TxnRightBound))
+	cluster.PutRegion(larger)
+	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
+	manager.SetResetVersionAllocator(func(context.Context) (uint64, error) { t.Error("split must not allocate T"); return 0, nil })
+	// Simulate the existing split scheduler forming both boundaries while Create waits.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cluster.PutRegion(newReuseTestRegion(42, 42))
+		cluster.PutRegion(newReuseTestRegion(43, 43))
+	}()
+	created, pending, err := manager.tryCreateReusedKeyspace("split-tenant", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, manager.reuse.now().Unix())
+	require.NoError(t, err)
+	require.Nil(t, pending)
+	require.Zero(t, created.PendingResetVersion)
+	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, created.State)
+	require.False(t, manager.KeyspaceUpdateRequiredForRegion(42))
+}
+
 func TestBitmapUpdatesPreserveOtherIDsAndLayout(t *testing.T) {
 	storage, _, manager := newReuseTestManager(t)
 	for _, id := range []uint32{42, 43, 999} {
@@ -143,29 +210,6 @@ func TestBitmapUpdatesPreserveOtherIDsAndLayout(t *testing.T) {
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return txn.Save(keyspaceBitmapLayoutPath(), "v1:64") }))
 	require.Error(t, manager.ensureBitmapLayout())
 }
-func TestMissingOrStaleStorageReportCannotCompleteReclaim(t *testing.T) {
-	_, cluster, manager := newReuseTestManager(t)
-	for id := uint32(41); id <= 43; id++ {
-		state := keyspacepb.KeyspaceState_ENABLED
-		if id == 42 {
-			state = keyspacepb.KeyspaceState_TOMBSTONE
-		}
-		saveReuseTestMeta(t, manager, id, state)
-		cluster.PutRegion(newReuseTestRegion(id, uint64(id)))
-	}
-	require.NoError(t, manager.RequestKeyspaceReclaim(42))
-	old := cluster.GetRegion(42)
-	manager.RecordRegionStorageState(old, &pdpb.RegionStorageState{ReclaimReady: true})
-	cluster.PutRegion(old.Clone(core.WithIncVersion()))
-	manager.advanceReuseTask(42)
-	meta, _ := manager.LoadKeyspaceByID(42)
-	require.Equal(t, keyspacepb.KeyspaceState_RECLAIMING, meta.State)
-	require.NoError(t, manager.StartIDReuse())
-	t.Cleanup(manager.StopIDReuse)
-	require.Empty(t, manager.reuse.reports)
-	require.NotNil(t, manager.currentReuseMeta(42))
-}
-
 func TestConcurrentClaimsUseDifferentBits(t *testing.T) {
 	// MemoryKV does not enforce transaction read conditions; use real etcd CAS.
 	_, client, clean := etcdutil.NewTestEtcdCluster(t, 1, nil)
@@ -192,40 +236,6 @@ func TestConcurrentClaimsUseDifferentBits(t *testing.T) {
 	require.NotEqual(t, one.id, two.id)
 }
 
-func TestNewReclaimRequiresFreshStorageReport(t *testing.T) {
-	_, cluster, manager := newReuseTestManager(t)
-	for id := uint32(41); id <= 43; id++ {
-		state := keyspacepb.KeyspaceState_ENABLED
-		if id == 42 {
-			state = keyspacepb.KeyspaceState_TOMBSTONE
-		}
-		saveReuseTestMeta(t, manager, id, state)
-		cluster.PutRegion(newReuseTestRegion(id, uint64(id)))
-	}
-	region := cluster.GetRegion(42)
-	manager.reuse.reports[42] = storageReport{
-		version: region.GetRegionEpoch().Version,
-		confVer: region.GetRegionEpoch().ConfVer,
-		leader:  region.GetLeader().Id,
-		state:   pdpb.RegionStorageState{ReclaimReady: true},
-	}
-	require.NoError(t, manager.RequestKeyspaceReclaim(42))
-	meta, err := manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_RECLAIMING, meta.State)
-	require.Nil(t, manager.appliedStorageState(region))
-	manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{ReclaimReady: false})
-	manager.advanceReuseTask(42)
-	meta, err = manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_RECLAIMING, meta.State)
-	manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{ReclaimReady: true})
-	manager.advanceReuseTask(42)
-	meta, err = manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_RECLAIMED, meta.State)
-}
-
 func TestReclaimRejectsProtectedIDsAndRawKeyspaces(t *testing.T) {
 	_, cluster, manager := newReuseTestManager(t)
 	for _, id := range []uint32{0, uint32(constant.ReservedKeyspaceIDStart), constant.SystemKeyspaceID, constant.MaxValidKeyspaceID} {
@@ -240,36 +250,6 @@ func TestReclaimRejectsProtectedIDsAndRawKeyspaces(t *testing.T) {
 	require.ErrorContains(t, manager.RequestKeyspaceReclaim(42), "transactional")
 }
 
-func TestDirtyStateDuringQuarantineRestartsCleanup(t *testing.T) {
-	_, cluster, manager := newReuseTestManager(t)
-	for id := uint32(41); id <= 43; id++ {
-		state := keyspacepb.KeyspaceState_ENABLED
-		if id == 42 {
-			state = keyspacepb.KeyspaceState_TOMBSTONE
-		}
-		saveReuseTestMeta(t, manager, id, state)
-		cluster.PutRegion(newReuseTestRegion(id, uint64(id)))
-	}
-	require.NoError(t, manager.RequestKeyspaceReclaim(42))
-	region := cluster.GetRegion(42)
-	manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{ReclaimReady: true})
-	manager.advanceReuseTask(42)
-	meta, err := manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_RECLAIMED, meta.State)
-	require.False(t, manager.KeyspaceUpdateRequiredForRegion(42))
-	manager.reuse.now = func() time.Time { return time.Unix(meta.StateChangedAt, 0).Add(7 * 24 * time.Hour) }
-	// A stale report cannot release the ID.
-	manager.advanceReuseTask(42)
-	require.True(t, manager.KeyspaceUpdateRequiredForRegion(42))
-	require.NotNil(t, manager.currentReuseMeta(42))
-	manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{ReclaimReady: false})
-	manager.advanceReuseTask(42)
-	meta, err = manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_RECLAIMING, meta.State)
-}
-
 func TestReuseWatermarkSurvivesRestartWithoutNewAllocation(t *testing.T) {
 	storage, cluster, manager := newReuseTestManager(t)
 	region := newReuseTestRegion(42, 42)
@@ -281,6 +261,21 @@ func TestReuseWatermarkSurvivesRestartWithoutNewAllocation(t *testing.T) {
 	}))
 	require.NoError(t, manager.StartIDReuse())
 	t.Cleanup(manager.StopIDReuse)
-	manager.RecordIDReuseCapability(1, 2)
+	manager.RecordIDReuseCapability(1, 3)
 	require.NoError(t, manager.reuseAdmissionReady(region))
+}
+
+func TestCMEKRequestLeavesFreeIDsForStarterReuse(t *testing.T) {
+	storage, cluster, manager := newReuseTestManager(t)
+	cluster.PutRegion(newReuseTestRegion(42, 42))
+	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
+	created, pending, err := manager.tryCreateReusedKeyspace("cmek-tenant", map[string]string{"encryption": `{"enabled":true,"vendor":"test","cmek_id":"test-customer-key"}`}, 1)
+	require.NoError(t, err)
+	require.Nil(t, created)
+	require.Nil(t, pending)
+	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		bits, e := txn.Load(bitmapPath(0))
+		require.NotZero(t, bits[42/8]&(1<<(42%8)))
+		return e
+	}))
 }
