@@ -1011,6 +1011,7 @@ func (s *GrpcServer) StoreHeartbeat(ctx context.Context, request *pdpb.StoreHear
 	rc.GetUnsafeRecoveryController().HandleStoreHeartbeat(request, resp)
 	stats := request.GetStats()
 	s.GetKeyspaceManager().RecordIDReuseCapability(stats.GetStoreId(), stats.GetKeyspaceIdReuseProtocolVersion())
+	resp.KeyspaceNameRevision, resp.InvalidatedKeyspaceIds, resp.InvalidateAllKeyspaceNames = s.GetKeyspaceManager().KeyspaceNameUpdates(request.GetKeyspaceNameRevision())
 
 	return resp, nil
 }

@@ -57,7 +57,7 @@ func newReuseTestManagerWithKV(t *testing.T, backend kv.Base) (*endpoint.Storage
 	require.NoError(t, kgm.Bootstrap(ctx))
 	manager := NewKeyspaceManager(ctx, storage, cluster, allocator, &mockConfig{EnableIDReuse: true, IDReuseThreshold: 10, IDReuseWorkerInterval: typeutil.NewDuration(time.Hour), WaitRegionSplitTimeout: typeutil.NewDuration(100 * time.Millisecond), CheckRegionSplitInterval: typeutil.NewDuration(time.Millisecond)}, kgm, nil)
 	manager.reuse.now = func() time.Time { return time.Unix(4_000_000, 0) }
-	manager.RecordIDReuseCapability(1, 3)
+	manager.RecordIDReuseCapability(1, 4)
 	var version atomic.Uint64
 	version.Store(1_000_000)
 	manager.SetResetVersionAllocator(func(context.Context) (uint64, error) { return version.Add(1), nil })
@@ -140,7 +140,7 @@ func TestNoSplitCreateRequiresMatchingAppliedVersionAndAllowsArchive(t *testing.
 	require.ErrorIs(t, err, errs.ErrKeyspaceExists)
 	require.NoError(t, manager.StartIDReuse())
 	t.Cleanup(manager.StopIDReuse)
-	manager.RecordIDReuseCapability(1, 3)
+	manager.RecordIDReuseCapability(1, 4)
 	manager.advanceReuseTask(42)
 	require.True(t, manager.KeyspaceUpdateRequiredForRegion(42))
 	_, err = manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_ARCHIVED, 5)
@@ -180,6 +180,9 @@ func TestSplitReuseDoesNotAllocateResetVersion(t *testing.T) {
 	larger := newReuseTestRegion(42, 42).Clone(core.WithStartKey(MakeRegionBound(41).TxnLeftBound), core.WithEndKey(MakeRegionBound(43).TxnRightBound))
 	cluster.PutRegion(larger)
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
+	manager.SetKeyspaceUpdateNotifier(func(region *core.RegionInfo) {
+		manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{Encrypted: false})
+	})
 	manager.SetResetVersionAllocator(func(context.Context) (uint64, error) { t.Error("split must not allocate T"); return 0, nil })
 	// Simulate the existing split scheduler forming both boundaries while Create waits.
 	go func() {
@@ -261,7 +264,7 @@ func TestReuseWatermarkSurvivesRestartWithoutNewAllocation(t *testing.T) {
 	}))
 	require.NoError(t, manager.StartIDReuse())
 	t.Cleanup(manager.StopIDReuse)
-	manager.RecordIDReuseCapability(1, 3)
+	manager.RecordIDReuseCapability(1, 4)
 	require.NoError(t, manager.reuseAdmissionReady(region))
 }
 
