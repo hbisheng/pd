@@ -241,6 +241,17 @@ func TestEncryptedSplitWithoutAppliedReportStaysDisabled(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, keyspacepb.KeyspaceState_DISABLED, meta.State)
 	require.Zero(t, meta.PendingResetVersion)
+	require.True(t, meta.PendingInitialization)
+	require.True(t, manager.KeyspaceUpdateRequiredForRegion(42))
+
+	// A timeout does not cancel initialization; a later applied report completes it.
+	manager.RecordRegionStorageState(cluster.GetRegion(42), &pdpb.RegionStorageState{Encrypted: true})
+	manager.advanceReuseTask(42)
+	meta, err = manager.LoadKeyspaceByID(42)
+	require.NoError(t, err)
+	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, meta.State)
+	require.False(t, meta.PendingInitialization)
+	require.Zero(t, meta.PendingResetVersion)
 	require.False(t, manager.KeyspaceUpdateRequiredForRegion(42))
 }
 

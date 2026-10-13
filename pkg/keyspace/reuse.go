@@ -34,6 +34,7 @@ import (
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/keyspace/constant"
 	mcsconstant "github.com/tikv/pd/pkg/mcs/utils/constant"
+	"github.com/tikv/pd/pkg/schedule/labeler"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
 	"github.com/tikv/pd/pkg/utils/etcdutil"
@@ -75,7 +76,6 @@ type reuseState struct {
 	scanStart       string
 	nameRevision    uint64
 	nameChanges     []nameChange
-	splitChecks     map[uint32]*keyspacepb.KeyspaceMeta
 	notify          func(*core.RegionInfo)
 	now             func() time.Time
 	allocateVersion func(context.Context) (uint64, error)
@@ -85,7 +85,7 @@ type reuseState struct {
 
 func newReuseState() *reuseState {
 	return &reuseState{pending: make(map[uint32]*keyspacepb.KeyspaceMeta), workQueue: list.New(), workItems: make(map[uint32]*list.Element), byRegion: make(map[uint64]uint32),
-		reports: make(map[uint64]storageReport), capable: make(map[uint64]bool), splitChecks: make(map[uint32]*keyspacepb.KeyspaceMeta), now: time.Now}
+		reports: make(map[uint64]storageReport), capable: make(map[uint64]bool), now: time.Now}
 }
 func cloneKeyspaceConfig(config map[string]string) map[string]string {
 	result := make(map[string]string, len(config))
@@ -96,6 +96,12 @@ func cloneKeyspaceConfig(config map[string]string) map[string]string {
 }
 func isReusePending(meta *keyspacepb.KeyspaceMeta) bool {
 	return meta != nil && meta.State == keyspacepb.KeyspaceState_DISABLED && meta.PendingResetVersion != 0
+}
+
+// isReuseInitializing also recognizes reset work persisted by earlier POCs.
+// The marker protects split initialization without inventing a reset version.
+func isReuseInitializing(meta *keyspacepb.KeyspaceMeta) bool {
+	return meta != nil && meta.State == keyspacepb.KeyspaceState_DISABLED && (meta.PendingInitialization || meta.PendingResetVersion != 0)
 }
 
 // SetResetVersionAllocator supplies a global TSO for each no-split creation.
@@ -135,18 +141,15 @@ func (manager *Manager) supportsReuseEncryption(config map[string]string) bool {
 func (manager *Manager) cacheReuseMeta(meta *keyspacepb.KeyspaceMeta) {
 	manager.reuse.mu.Lock()
 	defer manager.reuse.mu.Unlock()
-	if meta.State != keyspacepb.KeyspaceState_DISABLED {
-		delete(manager.reuse.splitChecks, meta.GetId())
-	}
 	for region, id := range manager.reuse.byRegion {
 		if id == meta.GetId() {
 			delete(manager.reuse.byRegion, region)
-			if !isReusePending(meta) {
+			if !isReuseInitializing(meta) {
 				delete(manager.reuse.reports, region)
 			}
 		}
 	}
-	if isReusePending(meta) {
+	if isReuseInitializing(meta) {
 		if manager.reuse.workItems[meta.GetId()] == nil {
 			manager.reuse.workItems[meta.GetId()] = manager.reuse.workQueue.PushBack(meta.GetId())
 		}
@@ -193,7 +196,6 @@ func (manager *Manager) StartIDReuse() error {
 	manager.reuse.nameChanges = nil
 	manager.reuse.watermark = watermark
 	manager.reuse.scanStart = bitmapPrefix()
-	manager.reuse.splitChecks = make(map[uint32]*keyspacepb.KeyspaceMeta)
 	manager.reuse.pending = make(map[uint32]*keyspacepb.KeyspaceMeta)
 	manager.reuse.workQueue = list.New()
 	manager.reuse.workItems = make(map[uint32]*list.Element)
@@ -211,7 +213,7 @@ func (manager *Manager) StartIDReuse() error {
 			return err
 		}
 		for _, meta := range metas {
-			if isReusePending(meta) {
+			if isReuseInitializing(meta) {
 				manager.cacheReuseMeta(meta)
 			}
 		}
@@ -259,7 +261,7 @@ func (manager *Manager) KeyspaceUpdateRequiredForRegion(regionID uint64) bool {
 	if !ok {
 		return false
 	}
-	return isReusePending(meta) || manager.reuse.splitChecks[id] != nil
+	return isReuseInitializing(meta)
 }
 
 // RecordIDReuseCapability rejects stores speaking the earlier POC protocol.
@@ -456,7 +458,10 @@ func (manager *Manager) advanceReuseTask(id uint32) {
 		return
 	}
 	manager.cacheReuseMeta(meta)
-	if !isReusePending(meta) {
+	if !isReuseInitializing(meta) {
+		return
+	}
+	if err := manager.ensureReuseRegionRule(meta); err != nil {
 		return
 	}
 	region, err := manager.exactKeyspaceRegion(id)
@@ -466,12 +471,43 @@ func (manager *Manager) advanceReuseTask(id uint32) {
 	}
 	manager.indexReuseRegion(id, region, true)
 	state := manager.appliedStorageState(region)
-	if state == nil || state.RestoreVersion != meta.PendingResetVersion || state.Encrypted != reuseEncryptionEnabled(meta.Config) {
+	if state == nil {
+		return
+	}
+	if meta.PendingResetVersion == 0 && state.Encrypted != reuseEncryptionEnabled(meta.Config) {
+		if err := manager.prepareSplitFallbackReset(meta); err != nil {
+			log.Warn("failed to prepare split fallback reset", zap.Uint32("keyspace-id", id), zap.Error(err))
+		}
+		return
+	}
+	if (meta.PendingResetVersion != 0 && state.RestoreVersion != meta.PendingResetVersion) || state.Encrypted != reuseEncryptionEnabled(meta.Config) {
 		return
 	}
 	if err := manager.completeReusedCreate(meta); err != nil {
 		log.Warn("failed to complete reused keyspace", zap.Uint32("keyspace-id", id), zap.Error(err))
 	}
+}
+
+// Recover a crash between claiming an ID and installing its boundary rule.
+// Serialize with Archive so canceled work cannot reinstall a deleted rule.
+func (manager *Manager) ensureReuseRegionRule(expected *keyspacepb.KeyspaceMeta) error {
+	manager.metaLock.Lock(expected.GetId())
+	defer manager.metaLock.Unlock(expected.GetId())
+	current, err := manager.LoadKeyspaceByID(expected.GetId())
+	if err != nil {
+		return err
+	}
+	if !isReuseInitializing(current) || current.Name != expected.Name || current.CreatedAt != expected.CreatedAt || current.PendingResetVersion != expected.PendingResetVersion || !maps.Equal(current.Config, expected.Config) {
+		return errors.New("pending creation changed before installing boundaries")
+	}
+	cluster, ok := manager.cluster.(interface{ GetRegionLabeler() *labeler.RegionLabeler })
+	if !ok {
+		return errors.New("cluster does not support region label")
+	}
+	if cluster.GetRegionLabeler().GetLabelRule(buildLabelRule(expected.GetId(), txnRegionBound).ID) != nil {
+		return nil
+	}
+	return manager.splitKeyspaceRegion(expected.GetId(), false, txnRegionBound)
 }
 
 // Complete only the same DISABLED owner with the same persisted target. Archive
@@ -485,7 +521,7 @@ func (manager *Manager) completeReusedCreate(expected *keyspacepb.KeyspaceMeta) 
 		if err != nil {
 			return err
 		}
-		if meta == nil || meta.Name != expected.Name || meta.CreatedAt != expected.CreatedAt || meta.State != keyspacepb.KeyspaceState_DISABLED || meta.PendingResetVersion != expected.PendingResetVersion || !maps.Equal(meta.Config, expected.Config) {
+		if meta == nil || meta.Name != expected.Name || meta.CreatedAt != expected.CreatedAt || !isReuseInitializing(meta) || meta.PendingResetVersion != expected.PendingResetVersion || !maps.Equal(meta.Config, expected.Config) {
 			return errors.New("pending creation changed")
 		}
 		if manager.kgm != nil {
@@ -495,6 +531,7 @@ func (manager *Manager) completeReusedCreate(expected *keyspacepb.KeyspaceMeta) 
 		}
 		meta.State = keyspacepb.KeyspaceState_ENABLED
 		meta.PendingResetVersion = 0
+		meta.PendingInitialization = false
 		meta.StateChangedAt = manager.reuse.now().Unix()
 		completed = meta
 		return manager.store.SaveKeyspaceMeta(txn, meta)
@@ -724,7 +761,7 @@ func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]s
 						if old != nil {
 							return errs.ErrEtcdTxnConflict
 						}
-						meta = &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: name, Config: cloneKeyspaceConfig(config), State: keyspacepb.KeyspaceState_DISABLED, CreatedAt: createTime, StateChangedAt: createTime}
+						meta = &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: name, Config: cloneKeyspaceConfig(config), State: keyspacepb.KeyspaceState_DISABLED, PendingInitialization: true, CreatedAt: createTime, StateChangedAt: createTime}
 						bound := MakeRegionBound(id)
 						if bytes.Equal(region.GetStartKey(), bound.TxnLeftBound) && bytes.Equal(region.GetEndKey(), bound.TxnRightBound) {
 							if resetVersion == 0 {
@@ -796,7 +833,7 @@ func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]s
 			delete(manager.reuse.reports, region.GetID())
 		}
 		manager.reuse.mu.Unlock()
-		if err := manager.splitKeyspaceRegion(meta.GetId(), meta.PendingResetVersion == 0, txnRegionBound); err != nil {
+		if err := manager.ensureReuseRegionRule(meta); err != nil {
 			// A claimed ID is never returned to free after an initialization timeout.
 			return nil, nil, err
 		}
@@ -809,11 +846,7 @@ func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]s
 				manager.advanceReuseTask(initialized.GetId())
 				return initialized, initialized, nil
 			}
-			if err := manager.completeReusedCreate(meta); err != nil {
-				return nil, nil, err
-			}
-			enabled, err := manager.LoadKeyspaceByID(meta.GetId())
-			return enabled, nil, err
+			return initialized, nil, nil
 		}
 		manager.advanceReuseTask(meta.GetId())
 		return meta, meta, nil
@@ -934,77 +967,68 @@ func reuseEncryptionEnabled(config map[string]string) bool {
 // Require applied encryption evidence; a child in the wrong mode falls back to reset.
 // Correct splits never allocate a reset version.
 func (manager *Manager) checkSplitEncryption(expected *keyspacepb.KeyspaceMeta) (*keyspacepb.KeyspaceMeta, error) {
-	manager.reuse.mu.Lock()
-	manager.reuse.splitChecks[expected.GetId()] = expected
-	manager.reuse.mu.Unlock()
-	defer func() {
-		manager.reuse.mu.Lock()
-		delete(manager.reuse.splitChecks, expected.GetId())
-		pending := manager.reuse.pending[expected.GetId()] != nil
-		manager.reuse.mu.Unlock()
-		if !pending {
-			manager.unindexReuseRegion(expected.GetId())
-		}
-	}()
 	ticker := time.NewTicker(manager.config.GetCheckRegionSplitInterval())
 	defer ticker.Stop()
 	timer := time.NewTimer(manager.config.GetWaitRegionSplitTimeout())
 	defer timer.Stop()
 	for {
+		manager.advanceReuseTask(expected.GetId())
 		current, err := manager.LoadKeyspaceByID(expected.GetId())
 		if err != nil {
 			return nil, err
 		}
-		if current.Name != expected.Name || current.CreatedAt != expected.CreatedAt || current.State != keyspacepb.KeyspaceState_DISABLED || current.PendingResetVersion != 0 || !maps.Equal(current.Config, expected.Config) {
+		if current.Name != expected.Name || current.CreatedAt != expected.CreatedAt || !maps.Equal(current.Config, expected.Config) {
 			return nil, errors.New("split creation was abandoned")
 		}
-		region, err := manager.exactKeyspaceRegion(expected.GetId())
-		if err == nil && manager.reuseAdmissionReady(region) == nil {
-			manager.indexReuseRegion(expected.GetId(), region, true)
-			if state := manager.appliedStorageState(region); state != nil {
-				if state.Encrypted == reuseEncryptionEnabled(expected.Config) {
-					return expected, nil
-				}
-				manager.reuse.mu.RLock()
-				allocate := manager.reuse.allocateVersion
-				manager.reuse.mu.RUnlock()
-				if allocate == nil {
-					return nil, errors.New("reset version allocator is unavailable")
-				}
-				version, err := allocate(manager.ctx)
-				if err != nil {
-					return nil, err
-				}
-				if version == 0 {
-					return nil, errors.New("reset version allocator returned zero")
-				}
-				manager.metaLock.Lock(expected.GetId())
-				err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-					meta, e := manager.store.LoadKeyspaceMeta(txn, expected.GetId())
-					if e != nil {
-						return e
-					}
-					if meta == nil || meta.Name != expected.Name || meta.CreatedAt != expected.CreatedAt || meta.State != keyspacepb.KeyspaceState_DISABLED || meta.PendingResetVersion != 0 || !maps.Equal(meta.Config, expected.Config) {
-						return errors.New("split creation changed before reset")
-					}
-					meta.PendingResetVersion = version
-					current = meta
-					return manager.store.SaveKeyspaceMeta(txn, meta)
-				})
-				manager.metaLock.Unlock(expected.GetId())
-				if err != nil {
-					return nil, err
-				}
-				manager.cacheReuseMeta(current)
-				return current, nil
-			}
+		if current.State == keyspacepb.KeyspaceState_ENABLED || isReusePending(current) {
+			return current, nil
+		}
+		if !isReuseInitializing(current) {
+			return nil, errors.New("split creation was abandoned")
 		}
 		select {
 		case <-manager.ctx.Done():
 			return nil, manager.ctx.Err()
 		case <-timer.C:
-			return nil, errors.New("split encryption initialization is still pending")
+			return nil, errors.New("split initialization is still pending; query status or archive to cancel")
 		case <-ticker.C:
 		}
 	}
+}
+
+// A split formed before the new config was visible may need the reset path.
+// CAS assigns one target; concurrent workers must not replace it on retries.
+func (manager *Manager) prepareSplitFallbackReset(expected *keyspacepb.KeyspaceMeta) error {
+	manager.reuse.mu.RLock()
+	allocate := manager.reuse.allocateVersion
+	manager.reuse.mu.RUnlock()
+	if allocate == nil {
+		return errors.New("reset version allocator is unavailable")
+	}
+	version, err := allocate(manager.ctx)
+	if err != nil {
+		return err
+	}
+	if version == 0 {
+		return errors.New("reset version allocator returned zero")
+	}
+	manager.metaLock.Lock(expected.GetId())
+	defer manager.metaLock.Unlock(expected.GetId())
+	var current *keyspacepb.KeyspaceMeta
+	err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		meta, err := manager.store.LoadKeyspaceMeta(txn, expected.GetId())
+		if err != nil {
+			return err
+		}
+		if meta == nil || meta.Name != expected.Name || meta.CreatedAt != expected.CreatedAt || !isReuseInitializing(meta) || meta.PendingResetVersion != 0 || !maps.Equal(meta.Config, expected.Config) {
+			return errors.New("split creation changed before reset")
+		}
+		meta.PendingResetVersion = version
+		current = meta
+		return manager.store.SaveKeyspaceMeta(txn, meta)
+	})
+	if err == nil {
+		manager.cacheReuseMeta(current)
+	}
+	return err
 }
