@@ -16,8 +16,6 @@ package keyspace
 
 import (
 	"bytes"
-	"container/list"
-	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -27,8 +25,8 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
+	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
-	"github.com/pingcap/log"
 	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/keyspace/constant"
@@ -40,13 +38,11 @@ import (
 	"github.com/tikv/pd/pkg/utils/keypath"
 	"github.com/tikv/pd/pkg/utils/typeutil"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.uber.org/zap"
 )
 
 const (
 	freeIDScanLimit        = 32
-	reuseProtocolVersion   = 5
-	storageReportTTL       = 10 * time.Minute
+	reuseProtocolVersion   = 6
 	nameChangeHistoryLimit = 1024
 )
 
@@ -55,35 +51,32 @@ type nameChange struct {
 	id       uint32
 }
 
-type storageReport struct {
-	version, confVer, leader uint64
-	state                    pdpb.RegionStorageState
-	receivedAt               time.Time
+// A split grant uses IDs already allocated by AskBatchSplit. TiKV reads the
+// keyspace configuration after receiving this grant, then reports applied children
+// through ReportBatchSplit. This evidence is deliberately not persisted: a lost
+// creation attempt is canceled rather than reconstructed from Region boundaries.
+type reuseSplitGrant struct {
+	source    *metapb.Region
+	children  map[uint64]struct{}
+	confirmed bool
 }
 
-// Only lifecycle metadata and bitmap buckets are durable. This index is rebuilt
-// on leadership changes; heartbeat handlers never load metadata from etcd.
 type reuseState struct {
 	mu           sync.RWMutex
 	pending      map[uint32]*keyspacepb.KeyspaceMeta
-	workQueue    *list.List
-	workItems    map[uint32]*list.Element
-	byRegion     map[uint64]uint32
-	reports      map[uint64]storageReport
+	grants       map[uint32]*reuseSplitGrant
 	capable      map[uint64]bool
 	watermark    uint64
 	scanStart    string
 	nameRevision uint64
 	nameChanges  []nameChange
 	now          func() time.Time
-	workerStop   context.CancelFunc
-	workerDone   chan struct{}
 }
 
 func newReuseState() *reuseState {
-	return &reuseState{pending: make(map[uint32]*keyspacepb.KeyspaceMeta), workQueue: list.New(), workItems: make(map[uint32]*list.Element), byRegion: make(map[uint64]uint32),
-		reports: make(map[uint64]storageReport), capable: make(map[uint64]bool), now: time.Now}
+	return &reuseState{pending: make(map[uint32]*keyspacepb.KeyspaceMeta), grants: make(map[uint32]*reuseSplitGrant), capable: make(map[uint64]bool), now: time.Now}
 }
+
 func cloneKeyspaceConfig(config map[string]string) map[string]string {
 	result := make(map[string]string, len(config))
 	for k, v := range config {
@@ -127,37 +120,19 @@ func (manager *Manager) supportsReuseEncryption(config map[string]string) bool {
 func (manager *Manager) cacheReuseMeta(meta *keyspacepb.KeyspaceMeta) {
 	manager.reuse.mu.Lock()
 	defer manager.reuse.mu.Unlock()
-	for region, id := range manager.reuse.byRegion {
-		if id == meta.GetId() {
-			delete(manager.reuse.byRegion, region)
-			if !isReuseInitializing(meta) {
-				delete(manager.reuse.reports, region)
-			}
-		}
-	}
 	if isReuseInitializing(meta) {
-		if manager.reuse.workItems[meta.GetId()] == nil {
-			manager.reuse.workItems[meta.GetId()] = manager.reuse.workQueue.PushBack(meta.GetId())
-		}
 		copy := *meta
 		copy.Config = cloneKeyspaceConfig(meta.Config)
 		manager.reuse.pending[meta.GetId()] = &copy
 	} else {
 		delete(manager.reuse.pending, meta.GetId())
-		if item := manager.reuse.workItems[meta.GetId()]; item != nil {
-			manager.reuse.workQueue.Remove(item)
-			delete(manager.reuse.workItems, meta.GetId())
-		}
+		delete(manager.reuse.grants, meta.GetId())
 	}
 	manager.keyspaceStateLookup.Store(meta.GetId(), meta.State)
 }
-func (manager *Manager) currentReuseMeta(id uint32) *keyspacepb.KeyspaceMeta {
-	manager.reuse.mu.RLock()
-	defer manager.reuse.mu.RUnlock()
-	return manager.reuse.pending[id]
-}
 
-// StartIDReuse reloads pending lifecycle states in pages after leader election.
+// StartIDReuse reloads allocator/cache revisions and cancels interrupted creations.
+// Without the original split grant, boundaries alone cannot prove initialization.
 func (manager *Manager) StartIDReuse() error {
 	// The allocator's in-memory window starts at zero after restart. Read its
 	// existing durable counter once, rather than requiring a new allocation.
@@ -183,10 +158,7 @@ func (manager *Manager) StartIDReuse() error {
 	manager.reuse.watermark = watermark
 	manager.reuse.scanStart = bitmapPrefix()
 	manager.reuse.pending = make(map[uint32]*keyspacepb.KeyspaceMeta)
-	manager.reuse.workQueue = list.New()
-	manager.reuse.workItems = make(map[uint32]*list.Element)
-	manager.reuse.byRegion = make(map[uint64]uint32)
-	manager.reuse.reports = make(map[uint64]storageReport)
+	manager.reuse.grants = make(map[uint32]*reuseSplitGrant)
 	manager.reuse.capable = make(map[uint64]bool)
 	manager.reuse.mu.Unlock()
 	if !manager.config.IsIDReuseEnabled() {
@@ -200,7 +172,9 @@ func (manager *Manager) StartIDReuse() error {
 		}
 		for _, meta := range metas {
 			if isReuseInitializing(meta) {
-				manager.cacheReuseMeta(meta)
+				if err := manager.cancelReusedCreate(meta); err != nil {
+					return err
+				}
 			}
 		}
 		if len(metas) < etcdutil.MaxEtcdTxnOps {
@@ -208,27 +182,7 @@ func (manager *Manager) StartIDReuse() error {
 		}
 		start = metas[len(metas)-1].GetId() + 1
 	}
-	if !manager.config.IsIDReuseEnabled() {
-		return nil
-	}
-	if err := manager.ensureBitmapLayout(); err != nil {
-		return err
-	}
-	manager.startReuseWorker()
-	return nil
-}
-
-// StopIDReuse joins leader-only retry work.
-func (manager *Manager) StopIDReuse() {
-	manager.reuse.mu.Lock()
-	stop, done := manager.reuse.workerStop, manager.reuse.workerDone
-	manager.reuse.workerStop = nil
-	manager.reuse.workerDone = nil
-	manager.reuse.mu.Unlock()
-	if stop != nil {
-		stop()
-		<-done
-	}
+	return manager.ensureBitmapLayout()
 }
 
 // RecordIDReuseCapability rejects stores speaking the earlier POC protocol.
@@ -238,30 +192,69 @@ func (manager *Manager) RecordIDReuseCapability(storeID uint64, version uint32) 
 	manager.reuse.mu.Unlock()
 }
 
-// RecordRegionStorageState records actual applied state from accepted leader
-// heartbeats. Reports are scoped to an epoch and are never durable.
-func (manager *Manager) RecordRegionStorageState(region *core.RegionInfo, state *pdpb.RegionStorageState) {
+// RecordReuseSplitGrant records only grants issued while this creation is pending.
+// TiKV protocol v6 reads keyspace metadata after AskBatchSplit returns; older
+// grants therefore cannot initialize a newly claimed ID.
+func (manager *Manager) RecordReuseSplitGrant(source *metapb.Region, splits []*pdpb.SplitID) {
+	if source == nil || len(splits) == 0 {
+		return
+	}
 	manager.reuse.mu.Lock()
 	defer manager.reuse.mu.Unlock()
-	if _, pending := manager.reuse.byRegion[region.GetID()]; !pending {
+	for id := range manager.reuse.pending {
+		bound := MakeRegionBound(id)
+		if !regionCoversKeyspace(source, bound) || regionMatchesKeyspace(source, bound) {
+			continue
+		}
+		children := make(map[uint64]struct{}, len(splits)+1)
+		children[source.GetId()] = struct{}{}
+		for _, split := range splits {
+			children[split.GetNewRegionId()] = struct{}{}
+		}
+		manager.reuse.grants[id] = &reuseSplitGrant{source: typeutil.DeepClone(source, core.RegionFactory), children: children}
+	}
+}
+
+// RecordReuseSplitResult accepts the applied split reported through the existing
+// RPC. Matching boundaries without these allocated child IDs is not completion.
+func (manager *Manager) RecordReuseSplitResult(regions []*metapb.Region) {
+	if len(regions) < 2 {
 		return
 	}
-	if state == nil {
-		return
+	manager.reuse.mu.Lock()
+	defer manager.reuse.mu.Unlock()
+	for id, grant := range manager.reuse.grants {
+		if len(regions) != len(grant.children) || !bytes.Equal(regions[0].GetStartKey(), grant.source.GetStartKey()) || !bytes.Equal(regions[len(regions)-1].GetEndKey(), grant.source.GetEndKey()) {
+			continue
+		}
+		valid, exact := true, false
+		seen := make(map[uint64]struct{}, len(regions))
+		for index, region := range regions {
+			_, known := grant.children[region.GetId()]
+			_, duplicate := seen[region.GetId()]
+			if !known || duplicate || region.GetRegionEpoch().GetVersion() != grant.source.GetRegionEpoch().GetVersion()+uint64(len(regions)-1) || region.GetRegionEpoch().GetConfVer() != grant.source.GetRegionEpoch().GetConfVer() || (index > 0 && !bytes.Equal(regions[index-1].GetEndKey(), region.GetStartKey())) {
+				valid = false
+				break
+			}
+			seen[region.GetId()] = struct{}{}
+			if regionMatchesKeyspace(region, MakeRegionBound(id)) {
+				exact = true
+			}
+		}
+		if valid && exact {
+			grant.confirmed = true
+		}
 	}
-	manager.reuse.reports[region.GetID()] = storageReport{version: region.GetRegionEpoch().GetVersion(), confVer: region.GetRegionEpoch().GetConfVer(), leader: region.GetLeader().GetId(), state: *state, receivedAt: manager.reuse.now()}
 }
-func (manager *Manager) appliedStorageState(region *core.RegionInfo) *pdpb.RegionStorageState {
-	manager.reuse.mu.RLock()
-	defer manager.reuse.mu.RUnlock()
-	report, ok := manager.reuse.reports[region.GetID()]
-	if !ok || manager.reuse.now().Sub(report.receivedAt) > storageReportTTL || report.version != region.GetRegionEpoch().GetVersion() || report.confVer != region.GetRegionEpoch().GetConfVer() ||
-		report.leader != region.GetLeader().GetId() || len(region.GetPendingPeers()) != 0 || len(region.GetDownPeers()) != 0 {
-		return nil
-	}
-	copy := report.state
-	return &copy
+
+func regionCoversKeyspace(region *metapb.Region, bound *RegionBound) bool {
+	return bytes.Compare(region.GetStartKey(), bound.TxnLeftBound) <= 0 && (len(region.GetEndKey()) == 0 || bytes.Compare(region.GetEndKey(), bound.TxnRightBound) >= 0)
 }
+
+func regionMatchesKeyspace(region *metapb.Region, bound *RegionBound) bool {
+	return bytes.Equal(region.GetStartKey(), bound.TxnLeftBound) && bytes.Equal(region.GetEndKey(), bound.TxnRightBound)
+}
+
 func (manager *Manager) rejectIndependentScheduling() error {
 	if cluster, ok := manager.cluster.(interface{ IsServiceIndependent(string) bool }); ok && cluster.IsServiceIndependent(mcsconstant.SchedulingServiceName) {
 		return errors.New("keyspace ID reuse is unsupported with independent scheduling service")
@@ -288,12 +281,12 @@ func (manager *Manager) reuseAdmissionReady(region *core.RegionInfo) error {
 	// Name-cache invalidation is cluster-wide, including stores with no target replica.
 	for _, store := range manager.cluster.GetBasicCluster().GetStores() {
 		if store.IsTiKV() && !store.IsRemoved() && !manager.reuse.capable[store.GetID()] {
-			return errors.Errorf("store %d has not reported reuse protocol v5", store.GetID())
+			return errors.Errorf("store %d has not reported reuse protocol v6", store.GetID())
 		}
 	}
 	for _, peer := range region.GetPeers() {
 		if !manager.reuse.capable[peer.GetStoreId()] {
-			return errors.Errorf("store %d has not reported reuse protocol v5", peer.GetStoreId())
+			return errors.Errorf("store %d has not reported reuse protocol v6", peer.GetStoreId())
 		}
 	}
 	return nil
@@ -338,7 +331,7 @@ func (manager *Manager) splittableKeyspaceRegion(id uint32) *core.RegionInfo {
 }
 
 // RequestKeyspaceReclaim releases an ID without modifying TiKV. Cleaner can
-// retry after the merge delay or while waiting for a cross-keyspace merge.
+// retry while waiting for a cross-keyspace merge.
 func (manager *Manager) RequestKeyspaceReclaim(id uint32) error {
 	if !reusableKeyspaceID(id) {
 		return newModifyProtectedKeyspaceError()
@@ -359,9 +352,6 @@ func (manager *Manager) RequestKeyspaceReclaim(id uint32) error {
 	if !manager.transactionalReuseConfig(meta.Config) {
 		return errors.New("ID reuse only supports transactional keyspaces")
 	}
-	if manager.reuse.now().Sub(time.Unix(meta.StateChangedAt, 0)) < manager.config.GetIDReuseMergeDelay() {
-		return nil
-	}
 	region := manager.splittableKeyspaceRegion(id)
 	if region == nil {
 		return nil
@@ -371,63 +361,38 @@ func (manager *Manager) RequestKeyspaceReclaim(id uint32) error {
 	}
 	return manager.releaseReclaimedID(meta)
 }
-func (manager *Manager) indexReuseRegion(id uint32, region *core.RegionInfo) {
-	manager.reuse.mu.Lock()
-	for r, k := range manager.reuse.byRegion {
-		if k == id && r != region.GetID() {
-			delete(manager.reuse.byRegion, r)
-		}
+func (manager *Manager) tryCompleteReusedCreate(expected *keyspacepb.KeyspaceMeta) error {
+	if !manager.config.IsIDReuseEnabled() {
+		return errors.New("keyspace ID reuse is disabled")
 	}
-	manager.reuse.byRegion[region.GetID()] = id
-	manager.reuse.mu.Unlock()
-}
-func (manager *Manager) unindexReuseRegion(id uint32) {
-	manager.reuse.mu.Lock()
-	defer manager.reuse.mu.Unlock()
-	for regionID, keyspaceID := range manager.reuse.byRegion {
-		if keyspaceID == id {
-			delete(manager.reuse.byRegion, regionID)
-			delete(manager.reuse.reports, regionID)
-		}
-	}
-}
-func (manager *Manager) advanceReuseTask(id uint32) {
-	if manager.currentReuseMeta(id) == nil || !manager.config.IsIDReuseEnabled() {
-		return
-	}
-	meta, err := manager.LoadKeyspaceByID(id)
+	region, err := manager.exactKeyspaceRegion(expected.GetId())
 	if err != nil {
-		return
+		return nil
 	}
-	manager.cacheReuseMeta(meta)
-	if !isReuseInitializing(meta) {
-		return
+	if err := manager.reuseAdmissionReady(region); err != nil {
+		return err
 	}
-	if err := manager.ensureReuseRegionRule(meta); err != nil {
-		return
+	manager.reuse.mu.RLock()
+	grant := manager.reuse.grants[expected.GetId()]
+	confirmed := grant != nil && grant.confirmed
+	belongs := false
+	if grant != nil {
+		_, belongs = grant.children[region.GetID()]
+		belongs = belongs && region.GetRegionEpoch().GetVersion() == grant.source.GetRegionEpoch().GetVersion()+uint64(len(grant.children)-1)
 	}
-	region, err := manager.exactKeyspaceRegion(id)
-	if err != nil || manager.reuseAdmissionReady(region) != nil {
-		manager.unindexReuseRegion(id)
-		return
+	manager.reuse.mu.RUnlock()
+	if !belongs {
+		return errors.New("reused keyspace no longer requires this creation's split")
 	}
-	manager.indexReuseRegion(id, region)
-	state := manager.appliedStorageState(region)
-	if state == nil {
-		return
+	// Heartbeat may arrive before ReportBatchSplit. Wait for that applied result,
+	// but never treat an exact range alone as successful initialization.
+	if !confirmed {
+		return nil
 	}
-	// A concurrent split may have fetched the configuration before the claim.
-	// Never repair a mismatched result with a destructive reset: leave it disabled
-	// for the caller to archive, and let the normal cleanup/merge cycle retry it.
-	if state.Encrypted != reuseEncryptionEnabled(meta.Config) {
-		return
-	}
-	if err := manager.completeReusedCreate(meta); err != nil {
-		log.Warn("failed to complete reused keyspace", zap.Uint32("keyspace-id", id), zap.Error(err))
-	}
+	return manager.completeReusedCreate(expected)
 }
 
-// Recover a crash between claiming an ID and installing its boundary rule.
+// Install the normal split rule only while the claimed range still needs split.
 // Serialize with Archive so canceled work cannot reinstall a deleted rule.
 func (manager *Manager) ensureReuseRegionRule(expected *keyspacepb.KeyspaceMeta) error {
 	manager.metaLock.Lock(expected.GetId())
@@ -445,6 +410,9 @@ func (manager *Manager) ensureReuseRegionRule(expected *keyspacepb.KeyspaceMeta)
 	}
 	if cluster.GetRegionLabeler().GetLabelRule(buildLabelRule(expected.GetId(), txnRegionBound).ID) != nil {
 		return nil
+	}
+	if manager.splittableKeyspaceRegion(expected.GetId()) == nil {
+		return errors.New("claimed keyspace no longer requires a split")
 	}
 	return manager.splitKeyspaceRegion(expected.GetId(), false, txnRegionBound)
 }
@@ -479,42 +447,33 @@ func (manager *Manager) completeReusedCreate(expected *keyspacepb.KeyspaceMeta) 
 	}
 	return err
 }
-func (manager *Manager) startReuseWorker() {
-	manager.reuse.mu.Lock()
-	defer manager.reuse.mu.Unlock()
-	if manager.reuse.workerStop != nil {
-		return
-	}
-	ctx, stop := context.WithCancel(manager.ctx)
-	done := make(chan struct{})
-	manager.reuse.workerStop = stop
-	manager.reuse.workerDone = done
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(manager.config.GetIDReuseWorkerInterval())
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				manager.runOneReuseTask()
-			}
+
+// cancelReusedCreate keeps the ID claimed and sends it through normal deletion.
+// It never frees an ID or removes data while a split may still be in flight.
+func (manager *Manager) cancelReusedCreate(expected *keyspacepb.KeyspaceMeta) error {
+	manager.metaLock.Lock(expected.GetId())
+	defer manager.metaLock.Unlock(expected.GetId())
+	var canceled *keyspacepb.KeyspaceMeta
+	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		meta, err := manager.store.LoadKeyspaceMeta(txn, expected.GetId())
+		if err != nil {
+			return err
 		}
-	}()
-}
-func (manager *Manager) runOneReuseTask() {
-	manager.reuse.mu.Lock()
-	item := manager.reuse.workQueue.Front()
-	if item == nil {
-		manager.reuse.mu.Unlock()
-		return
+		if meta == nil || meta.Name != expected.Name || meta.CreatedAt != expected.CreatedAt || !isReuseInitializing(meta) {
+			return nil
+		}
+		if err := manager.transformKeyspaceState(txn, meta, keyspacepb.KeyspaceState_ARCHIVED, manager.reuse.now().Unix()); err != nil {
+			return err
+		}
+		canceled = meta
+		return manager.store.SaveKeyspaceMeta(txn, meta)
+	})
+	if err == nil && canceled != nil {
+		manager.cacheReuseMeta(canceled)
 	}
-	id := item.Value.(uint32)
-	manager.reuse.workQueue.MoveToBack(item)
-	manager.reuse.mu.Unlock()
-	manager.advanceReuseTask(id)
+	return err
 }
+
 func keyspaceBitmapLayoutPath() string    { return keypath.KeyspaceFreePrefix() + "layout" }
 func bitmapPrefix() string                { return keypath.KeyspaceFreePrefix() + "buckets/" }
 func bitmapPath(bucket uint32) string     { return fmt.Sprintf("%s%08d", bitmapPrefix(), bucket) }
@@ -586,9 +545,6 @@ func (manager *Manager) releaseReclaimedID(expected *keyspacepb.KeyspaceMeta) er
 		if meta == nil || meta.State != keyspacepb.KeyspaceState_TOMBSTONE || meta.StateChangedAt != expected.StateChangedAt {
 			return errors.New("reclaimed state changed")
 		}
-		if manager.reuse.now().Sub(time.Unix(meta.StateChangedAt, 0)) < manager.config.GetIDReuseMergeDelay() {
-			return errors.New("reuse delay has not elapsed")
-		}
 		if err := manager.unassignKeyspaceFromMetaServiceGroup(txn, meta); err != nil {
 			return err
 		}
@@ -605,18 +561,14 @@ func (manager *Manager) releaseReclaimedID(expected *keyspacepb.KeyspaceMeta) er
 		manager.publishNameRevision(revision, expected.GetId())
 		manager.reuse.mu.Lock()
 		delete(manager.reuse.pending, expected.GetId())
-		if item := manager.reuse.workItems[expected.GetId()]; item != nil {
-			manager.reuse.workQueue.Remove(item)
-			delete(manager.reuse.workItems, expected.GetId())
-		}
+		delete(manager.reuse.grants, expected.GetId())
 		manager.reuse.mu.Unlock()
-		manager.unindexReuseRegion(expected.GetId())
 		manager.keyspaceNameLookup.Delete(expected.GetId())
 		manager.keyspaceStateLookup.Delete(expected.GetId())
 	}
 	return err
 }
-func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]string, createTime int64) (*keyspacepb.KeyspaceMeta, *keyspacepb.KeyspaceMeta, error) {
+func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]string, createTime int64) (*keyspacepb.KeyspaceMeta, error) {
 	var existing *keyspacepb.KeyspaceMeta
 	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		found, id, err := manager.store.LoadKeyspaceID(txn, name)
@@ -627,16 +579,16 @@ func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]s
 		return err
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if existing != nil {
-		return nil, nil, errs.ErrKeyspaceExists
+		return nil, errs.ErrKeyspaceExists
 	}
 	if !manager.config.IsIDReuseEnabled() || !manager.transactionalReuseConfig(config) || !manager.supportsReuseEncryption(config) {
-		return nil, nil, nil
+		return nil, nil
 	}
 	if err := manager.ensureBitmapLayout(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	manager.reuse.mu.RLock()
 	scanStart := manager.reuse.scanStart
@@ -727,37 +679,40 @@ func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]s
 		})
 		if err != nil {
 			if errors.ErrorEqual(err, errs.ErrKeyspaceExists) {
-				return nil, nil, err
+				return nil, err
 			}
 			if errors.ErrorEqual(err, errs.ErrEtcdTxnConflict) {
 				continue
 			}
-			return nil, nil, err
+			return nil, err
 		}
 		manager.reuse.mu.Lock()
 		manager.reuse.scanStart = nextScanStart
 		manager.reuse.mu.Unlock()
 		if meta == nil {
-			return nil, nil, nil
+			return nil, nil
 		}
 		manager.publishNameRevision(revision, meta.GetId())
 		manager.cacheReuseMeta(meta)
 		manager.keyspaceNameLookup.Store(meta.GetId(), name)
-		manager.reuse.mu.Lock()
-		if region := manager.coveringKeyspaceRegion(meta.GetId()); region != nil {
-			delete(manager.reuse.reports, region.GetID())
-		}
-		manager.reuse.mu.Unlock()
 		if err := manager.ensureReuseRegionRule(meta); err != nil {
-			// A claimed ID is never returned to free after an initialization timeout.
-			return nil, nil, err
+			if cancelErr := manager.cancelReusedCreate(meta); cancelErr != nil {
+				return nil, cancelErr
+			}
+			return nil, err
 		}
-		manager.advanceReuseTask(meta.GetId())
-		return meta, meta, nil
+		return meta, nil
 	}
-	return nil, nil, errors.New("free bitmap remained contended")
+	return nil, errors.New("free bitmap remained contended")
 }
-func (manager *Manager) waitReusedCreate(meta *keyspacepb.KeyspaceMeta) (*keyspacepb.KeyspaceMeta, error) {
+func (manager *Manager) waitReusedCreate(meta *keyspacepb.KeyspaceMeta) (result *keyspacepb.KeyspaceMeta, err error) {
+	defer func() {
+		if err != nil {
+			if cancelErr := manager.cancelReusedCreate(meta); cancelErr != nil {
+				err = errors.Annotatef(cancelErr, "cancel failed creation: %v", err)
+			}
+		}
+	}()
 	ticker := time.NewTicker(manager.config.GetCheckRegionSplitInterval())
 	defer ticker.Stop()
 	timer := time.NewTimer(manager.config.GetWaitRegionSplitTimeout())
@@ -780,9 +735,11 @@ func (manager *Manager) waitReusedCreate(meta *keyspacepb.KeyspaceMeta) (*keyspa
 		case <-manager.ctx.Done():
 			return nil, errors.New("pending reused creation canceled")
 		case <-timer.C:
-			return nil, errors.New("reused creation is still pending; query status or archive to cancel")
+			return nil, errors.New("reused creation timed out and was canceled")
 		case <-ticker.C:
-			manager.advanceReuseTask(meta.GetId())
+			if err := manager.tryCompleteReusedCreate(meta); err != nil {
+				return nil, err
+			}
 		}
 	}
 }
@@ -858,11 +815,4 @@ func (manager *Manager) KeyspaceNameUpdates(since uint64) (uint64, []uint32, boo
 		}
 	}
 	return revision, ids, false
-}
-
-func reuseEncryptionEnabled(config map[string]string) bool {
-	var value struct {
-		Enabled bool `json:"enabled"`
-	}
-	return json.Unmarshal([]byte(config["encryption"]), &value) == nil && value.Enabled
 }

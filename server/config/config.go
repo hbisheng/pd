@@ -251,7 +251,6 @@ const (
 	minCheckRegionSplitInterval     = 1 * time.Millisecond
 	maxCheckRegionSplitInterval     = 100 * time.Millisecond
 	defaultKeyspaceIDReuseThreshold = uint64(1_000_000)
-	defaultKeyspaceIDReuseInterval  = time.Second
 
 	defaultEnableSchedulingFallback      = true
 	defaultEnableTSODynamicSwitching     = false
@@ -892,10 +891,6 @@ type KeyspaceConfig struct {
 	// IDReuseThreshold is the minimum reserved allocator-window end at which
 	// new reclamation requests are admitted.
 	IDReuseThreshold uint64 `toml:"id-reuse-threshold" json:"id-reuse-threshold"`
-	// IDReuseMergeDelay allows tombstoned Regions time to merge before releasing IDs.
-	IDReuseMergeDelay typeutil.Duration `toml:"id-reuse-merge-delay" json:"id-reuse-merge-delay"`
-	// IDReuseWorkerInterval bounds background split-initialization retries.
-	IDReuseWorkerInterval typeutil.Duration `toml:"id-reuse-worker-interval" json:"id-reuse-worker-interval"`
 	// MetaServiceGroups is the available external meta-service groups.
 	// The key is the meta-service group name, and the value is the corresponding endpoint.
 	MetaServiceGroups map[string]string `toml:"meta-service-groups" json:"meta-service-groups"`
@@ -913,12 +908,6 @@ func (c *KeyspaceConfig) Validate() error {
 	if c.CheckRegionSplitInterval.Duration >= c.WaitRegionSplitTimeout.Duration {
 		return errors.New("[keyspace] check-region-split-interval should be less than wait-region-split-timeout")
 	}
-	if c.IDReuseMergeDelay.Duration < 0 {
-		return errors.New("id-reuse-merge-delay cannot be negative")
-	}
-	if c.IDReuseWorkerInterval.Duration <= 0 {
-		return errors.New("[keyspace] id-reuse-worker-interval must be positive")
-	}
 	return nil
 }
 
@@ -934,13 +923,6 @@ func (c *KeyspaceConfig) adjust(meta *configutil.ConfigMetaData) error {
 	}
 	if !meta.IsDefined("id-reuse-threshold") {
 		c.IDReuseThreshold = defaultKeyspaceIDReuseThreshold
-	}
-	if !meta.IsDefined("id-reuse-worker-interval") {
-		c.IDReuseWorkerInterval = typeutil.NewDuration(defaultKeyspaceIDReuseInterval)
-	}
-
-	if !meta.IsDefined("id-reuse-merge-delay") {
-		c.IDReuseMergeDelay = typeutil.NewDuration(3 * 24 * time.Hour)
 	}
 
 	return AdjustMetaServiceGroups(c.MetaServiceGroups)
@@ -1030,11 +1012,6 @@ func (c *KeyspaceConfig) GetIDReuseThreshold() uint64 {
 	return c.IDReuseThreshold
 }
 
-// GetIDReuseWorkerInterval returns the durable task worker interval.
-func (c *KeyspaceConfig) GetIDReuseWorkerInterval() time.Duration {
-	return c.IDReuseWorkerInterval.Duration
-}
-
 // GetMetaServiceGroups returns the current meta-service-group configuration.
 func (c *KeyspaceConfig) GetMetaServiceGroups() map[string]string {
 	ret := make(map[string]string, len(c.MetaServiceGroups))
@@ -1056,9 +1033,6 @@ func (c *KeyspaceConfig) GetIDReuseBucketBytes() int {
 	}
 	return c.IDReuseBucketBytes
 }
-
-// GetIDReuseMergeDelay returns the wait after TOMBSTONE, before ID release.
-func (c *KeyspaceConfig) GetIDReuseMergeDelay() time.Duration { return c.IDReuseMergeDelay.Duration }
 
 // IsEncryptedIDReuseEnabled enables legacy encryption reuse in the POC.
 func (c *KeyspaceConfig) IsEncryptedIDReuseEnabled() bool { return c.EnableEncryptedIDReuse }

@@ -872,7 +872,6 @@ func (s *Server) createRaftCluster() error {
 
 func (s *Server) stopRaftCluster() {
 	failpoint.Inject("raftclusterIsBusy", func() {})
-	s.keyspaceManager.StopIDReuse()
 	s.cluster.Stop()
 }
 

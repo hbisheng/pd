@@ -70,7 +70,6 @@ type mockConfig struct {
 	CheckRegionSplitInterval typeutil.Duration
 	EnableIDReuse            bool
 	IDReuseThreshold         uint64
-	IDReuseWorkerInterval    typeutil.Duration
 	// MetaServiceGroups is used to mock the meta-service groups for keyspace assignment.
 	MetaServiceGroups map[string]string
 }
@@ -97,13 +96,6 @@ func (m *mockConfig) IsIDReuseEnabled() bool {
 
 func (m *mockConfig) GetIDReuseThreshold() uint64 {
 	return m.IDReuseThreshold
-}
-
-func (m *mockConfig) GetIDReuseWorkerInterval() time.Duration {
-	if m.IDReuseWorkerInterval.Duration == 0 {
-		return time.Second
-	}
-	return m.IDReuseWorkerInterval.Duration
 }
 
 func (m *mockConfig) SetMetaServiceGroups(metaServiceGroups map[string]string) {
@@ -1231,5 +1223,3 @@ func (suite *keyspaceTestSuite) TestTombstoneKeyspaceUnassignsMetaServiceGroup()
 
 func (m *mockConfig) GetIDReuseBucketBytes() int      { return 32 }
 func (m *mockConfig) IsEncryptedIDReuseEnabled() bool { return true }
-
-func (m *mockConfig) GetIDReuseMergeDelay() time.Duration { return 3 * 24 * time.Hour }

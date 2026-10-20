@@ -17,89 +17,124 @@ package keyspace
 import (
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
+	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
-
+	"github.com/stretchr/testify/require"
 	"github.com/tikv/pd/pkg/core"
-	"github.com/tikv/pd/pkg/errs"
+	"github.com/tikv/pd/pkg/mock/mockcluster"
 	"github.com/tikv/pd/pkg/storage/kv"
 )
 
-func TestSplitInitializationSurvivesTimeoutAndRestart(t *testing.T) {
+func claimSplitReuse(t *testing.T) (*mockcluster.Cluster, *Manager, *keyspacepb.KeyspaceMeta, *metapb.Region) {
 	storage, cluster, manager := newReuseTestManager(t)
-	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
+	source := newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound))
+	cluster.PutRegion(source)
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
-	config := map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}
-	claimed, _, err := manager.tryCreateReusedKeyspace("split-timeout", config, 1)
+	meta, err := manager.tryCreateReusedKeyspace("split-tenant", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
 	require.NoError(t, err)
-	_, err = manager.waitReusedCreate(claimed)
-	require.Error(t, err)
-	pending, err := manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.True(t, pending.PendingInitialization)
-	require.Equal(t, keyspacepb.KeyspaceState_DISABLED, pending.State)
-	ruleID := buildLabelRule(42, txnRegionBound).ID
-	require.NotNil(t, cluster.GetRegionLabeler().GetLabelRule(ruleID), "timeout must keep the split rule")
+	return cluster, manager, meta, source.GetMeta()
+}
 
-	// The guard is persisted, so losing every process-local map cannot bypass it.
-	manager.reuse = newReuseState()
-	_, err = manager.UpdateKeyspaceState("split-timeout", keyspacepb.KeyspaceState_ENABLED, 2)
-	require.Error(t, err)
-	_, err = manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_ENABLED, 2)
-	require.Error(t, err)
-	mutations := []*Mutation{{Op: OpPut, Key: "encryption", Value: `{"enabled":true}`}}
-	_, err = manager.UpdateKeyspaceConfig("split-timeout", mutations)
-	require.Error(t, err)
-	_, err = manager.UpdateKeyspaceConfigWithPreconditions("split-timeout", mutations, map[string]*string{"encryption": nil})
-	require.Error(t, err)
+func applyReuseTestSplit(cluster *mockcluster.Cluster, childID uint64) []*metapb.Region {
+	left := newReuseTestRegion(42, childID).Clone(core.WithIncVersion())
+	right := newReuseTestRegion(43, 420).Clone(core.WithIncVersion())
+	cluster.PutRegion(left)
+	cluster.PutRegion(right)
+	return []*metapb.Region{left.GetMeta(), right.GetMeta()}
+}
 
-	// Also cover a crash before the initial boundary rule was installed.
-	require.NoError(t, cluster.GetRegionLabeler().DeleteLabelRule(ruleID))
-	require.NoError(t, manager.StartIDReuse())
-	t.Cleanup(manager.StopIDReuse)
-	manager.RecordIDReuseCapability(1, reuseProtocolVersion)
-	manager.advanceReuseTask(42)
-	require.NotNil(t, cluster.GetRegionLabeler().GetLabelRule(ruleID))
-	cluster.PutRegion(newReuseTestRegion(42, 42))
-	cluster.PutRegion(newReuseTestRegion(43, 43))
-	manager.advanceReuseTask(42)
-	manager.RecordRegionStorageState(cluster.GetRegion(42), &pdpb.RegionStorageState{})
-	manager.advanceReuseTask(42)
+func TestSplitCompletionRequiresMatchingGrantAndReport(t *testing.T) {
+	cluster, manager, pending, source := claimSplitReuse(t)
+	manager.RecordReuseSplitGrant(source, []*pdpb.SplitID{{NewRegionId: 42}})
+	result := applyReuseTestSplit(cluster, 42)
+	// A child heartbeat can arrive before the asynchronous applied split report.
+	require.NoError(t, manager.tryCompleteReusedCreate(pending))
 	current, err := manager.LoadKeyspaceByID(42)
+	require.NoError(t, err)
+	require.Equal(t, keyspacepb.KeyspaceState_DISABLED, current.State)
+	manager.RecordReuseSplitResult(result)
+	current, err = manager.waitReusedCreate(pending)
 	require.NoError(t, err)
 	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, current.State)
 	require.False(t, current.PendingInitialization)
-	_, _, err = manager.tryCreateReusedKeyspace("split-timeout", config, 3)
-	require.ErrorIs(t, err, errs.ErrKeyspaceExists)
+	require.Empty(t, manager.reuse.grants)
 }
 
-func TestArchiveCancelsPendingSplitAndLateCompletion(t *testing.T) {
-	storage, cluster, manager := newReuseTestManager(t)
-	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
-	_, _, err := manager.tryCreateReusedKeyspace("canceled-split", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
+func TestSplitReportBeforeHeartbeatCompletesAfterRegionAppears(t *testing.T) {
+	cluster, manager, pending, source := claimSplitReuse(t)
+	manager.RecordReuseSplitGrant(source, []*pdpb.SplitID{{NewRegionId: 42}})
+	result := []*metapb.Region{newReuseTestRegion(42, 42).Clone(core.WithIncVersion()).GetMeta(), newReuseTestRegion(43, 420).Clone(core.WithIncVersion()).GetMeta()}
+	manager.RecordReuseSplitResult(result)
+	require.NoError(t, manager.tryCompleteReusedCreate(pending))
+	current, err := manager.LoadKeyspaceByID(42)
 	require.NoError(t, err)
-	pending, err := manager.LoadKeyspaceByID(42)
+	require.Equal(t, keyspacepb.KeyspaceState_DISABLED, current.State)
+	applyReuseTestSplit(cluster, 42)
+	current, err = manager.waitReusedCreate(pending)
 	require.NoError(t, err)
-	canceled, err := manager.UpdateKeyspaceState("canceled-split", keyspacepb.KeyspaceState_ARCHIVED, 2)
-	require.NoError(t, err)
-	require.False(t, canceled.PendingInitialization)
-	ruleID := buildLabelRule(42, txnRegionBound).ID
-	require.NoError(t, cluster.GetRegionLabeler().DeleteLabelRule(ruleID))
-	cluster.PutRegion(newReuseTestRegion(42, 42))
-	manager.RecordRegionStorageState(cluster.GetRegion(42), &pdpb.RegionStorageState{})
-	manager.advanceReuseTask(42)
-	require.Error(t, manager.ensureReuseRegionRule(pending))
-	require.Error(t, manager.completeReusedCreate(pending))
-	require.Nil(t, cluster.GetRegionLabeler().GetLabelRule(ruleID))
+	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, current.State)
+}
+
+func TestReusedCreateTimeoutArchivesAndKeepsIDClaimed(t *testing.T) {
+	cluster, manager, pending, source := claimSplitReuse(t)
+	manager.RecordReuseSplitGrant(source, []*pdpb.SplitID{{NewRegionId: 42}})
+	applyReuseTestSplit(cluster, 42)
+	// A lost ReportBatchSplit must not be replaced by observing exact boundaries.
+	_, err := manager.waitReusedCreate(pending)
+	require.ErrorContains(t, err, "timed out")
 	current, err := manager.LoadKeyspaceByID(42)
 	require.NoError(t, err)
 	require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, current.State)
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+	require.False(t, current.PendingInitialization)
+	require.NotNil(t, cluster.GetRegionLabeler().GetLabelRule(buildLabelRule(42, txnRegionBound).ID))
+	require.NoError(t, manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		bits, err := txn.Load(bitmapPath(0))
-		require.Empty(t, bits, "cancellation must not immediately free the claimed ID")
+		require.Empty(t, bits)
 		return err
 	}))
+}
+
+func TestOldSplitCannotCompleteNewClaim(t *testing.T) {
+	cluster, manager, pending, source := claimSplitReuse(t)
+	manager.RecordReuseSplitGrant(source, []*pdpb.SplitID{{NewRegionId: 44}})
+	// A different split allocation won the Raft race.
+	manager.RecordReuseSplitResult(applyReuseTestSplit(cluster, 42))
+	_, err := manager.waitReusedCreate(pending)
+	require.ErrorContains(t, err, "no longer requires")
+	current, err := manager.LoadKeyspaceByID(42)
+	require.NoError(t, err)
+	require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, current.State)
+}
+
+func TestPendingSplitCannotBypassInitializationAndRestartCancels(t *testing.T) {
+	_, manager, pending, _ := claimSplitReuse(t)
+	_, err := manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_ENABLED, 2)
+	require.Error(t, err)
+	mutations := []*Mutation{{Op: OpPut, Key: "encryption", Value: `{"enabled":true}`}}
+	_, err = manager.UpdateKeyspaceConfig(pending.Name, mutations)
+	require.Error(t, err)
+	_, err = manager.UpdateKeyspaceConfigWithPreconditions(pending.Name, mutations, map[string]*string{"encryption": nil})
+	require.Error(t, err)
+	manager.reuse = newReuseState()
+	require.NoError(t, manager.StartIDReuse())
+	current, err := manager.LoadKeyspaceByID(42)
+	require.NoError(t, err)
+	require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, current.State)
+	require.False(t, current.PendingInitialization)
+	require.Error(t, manager.ensureReuseRegionRule(pending))
+	require.Error(t, manager.completeReusedCreate(pending))
+}
+
+func TestArchiveRejectsLateAppliedSplit(t *testing.T) {
+	cluster, manager, pending, source := claimSplitReuse(t)
+	manager.RecordReuseSplitGrant(source, []*pdpb.SplitID{{NewRegionId: 42}})
+	_, err := manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_ARCHIVED, 2)
+	require.NoError(t, err)
+	manager.RecordReuseSplitResult(applyReuseTestSplit(cluster, 42))
+	require.Error(t, manager.completeReusedCreate(pending))
+	current, err := manager.LoadKeyspaceByID(42)
+	require.NoError(t, err)
+	require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, current.State)
+	require.Empty(t, manager.reuse.grants)
 }

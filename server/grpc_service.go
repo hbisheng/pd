@@ -1427,7 +1427,6 @@ func (s *GrpcServer) RegionHeartbeat(stream pdpb.PD_RegionHeartbeatServer) error
 		}
 		regionHeartbeatHandleDuration.WithLabelValues(storeAddress, storeLabel).Observe(time.Since(start).Seconds())
 		regionHeartbeatCounter.WithLabelValues(storeAddress, storeLabel, "report", "ok").Inc()
-		s.GetKeyspaceManager().RecordRegionStorageState(region, request.GetStorageState())
 
 		if rc.IsServiceIndependent(constant.SchedulingServiceName) {
 			if forwardErrCh != nil {
@@ -1829,6 +1828,8 @@ func (s *GrpcServer) AskBatchSplit(ctx context.Context, request *pdpb.AskBatchSp
 		}, nil
 	}
 
+	s.GetKeyspaceManager().RecordReuseSplitGrant(request.GetRegion(), split.GetIds())
+
 	return &pdpb.AskBatchSplitResponse{
 		Header: grpcutil.WrapHeader(),
 		Ids:    split.Ids,
@@ -1898,6 +1899,8 @@ func (s *GrpcServer) ReportBatchSplit(ctx context.Context, request *pdpb.ReportB
 				err.Error()),
 		}, nil
 	}
+
+	s.GetKeyspaceManager().RecordReuseSplitResult(request.GetRegions())
 
 	return &pdpb.ReportBatchSplitResponse{
 		Header: grpcutil.WrapHeader(),

@@ -81,8 +81,6 @@ type Config interface {
 	GetCheckRegionSplitInterval() time.Duration
 	IsIDReuseEnabled() bool
 	GetIDReuseThreshold() uint64
-	GetIDReuseWorkerInterval() time.Duration
-	GetIDReuseMergeDelay() time.Duration
 	GetIDReuseBucketBytes() int
 	IsEncryptedIDReuseEnabled() bool
 	// GetMetaServiceGroups returns the meta-service groups for keyspace assignment.
@@ -304,7 +302,7 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 	tracer.OnGetConfigFinished()
 
 	// Reused Create waits for the existing split initialization to finish.
-	reused, task, err := manager.tryCreateReusedKeyspace(request.Name, request.Config, request.CreateTime)
+	reused, err := manager.tryCreateReusedKeyspace(request.Name, request.Config, request.CreateTime)
 	if err != nil {
 		return nil, err
 	}
@@ -312,11 +310,9 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 		tracer.SetKeyspace(reused.GetId(), request.Name)
 		tracer.OnAllocateIDFinished()
 		tracer.OnSaveKeyspaceMetaFinished()
-		if task != nil {
-			reused, err = manager.waitReusedCreate(task)
-			if err != nil {
-				return nil, err
-			}
+		reused, err = manager.waitReusedCreate(reused)
+		if err != nil {
+			return nil, err
 		}
 		tracer.OnEnableKeyspaceFinished()
 		if manager.mgm != nil {

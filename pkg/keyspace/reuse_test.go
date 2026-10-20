@@ -53,7 +53,7 @@ func newReuseTestManagerWithKV(t *testing.T, backend kv.Base) (*endpoint.Storage
 	require.NoError(t, allocator.SetBase(100))
 	kgm := NewKeyspaceGroupManager(ctx, storage, nil)
 	require.NoError(t, kgm.Bootstrap(ctx))
-	manager := NewKeyspaceManager(ctx, storage, cluster, allocator, &mockConfig{EnableIDReuse: true, IDReuseThreshold: 10, IDReuseWorkerInterval: typeutil.NewDuration(time.Hour), WaitRegionSplitTimeout: typeutil.NewDuration(100 * time.Millisecond), CheckRegionSplitInterval: typeutil.NewDuration(time.Millisecond)}, kgm, nil)
+	manager := NewKeyspaceManager(ctx, storage, cluster, allocator, &mockConfig{EnableIDReuse: true, IDReuseThreshold: 10, WaitRegionSplitTimeout: typeutil.NewDuration(100 * time.Millisecond), CheckRegionSplitInterval: typeutil.NewDuration(time.Millisecond)}, kgm, nil)
 	manager.reuse.now = func() time.Time { return time.Unix(4_000_000, 0) }
 	manager.RecordIDReuseCapability(1, reuseProtocolVersion)
 	require.NoError(t, manager.ensureBitmapLayout())
@@ -73,16 +73,13 @@ func prepareIsolatedReuse(t *testing.T, manager *Manager, cluster *mockcluster.C
 		cluster.PutRegion(newReuseTestRegion(id, uint64(id)))
 	}
 }
-func TestReclaimReleasesIDWithoutResetAfterMergeDelay(t *testing.T) {
+func TestReclaimMergedIDWithoutAdditionalDelay(t *testing.T) {
 	storage, cluster, manager := newReuseTestManager(t)
 	prepareIsolatedReuse(t, manager, cluster)
-	cluster.PutRegion(newReuseTestRegion(42, 42).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
-	meta, _ := manager.LoadKeyspaceByID(42)
-	manager.reuse.now = func() time.Time { return time.Unix(meta.StateChangedAt, 0).Add(2 * 24 * time.Hour) }
-	require.NoError(t, manager.RequestKeyspaceReclaim(42))
-	_, err := manager.LoadKeyspaceByID(42)
+	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
+	meta, err := manager.LoadKeyspaceByID(42)
 	require.NoError(t, err)
-	manager.reuse.now = func() time.Time { return time.Unix(meta.StateChangedAt, 0).Add(3 * 24 * time.Hour) }
+	manager.reuse.now = func() time.Time { return time.Unix(meta.StateChangedAt, 0) }
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
 	_, err = manager.LoadKeyspaceByID(42)
 	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
@@ -94,6 +91,7 @@ func TestReclaimReleasesIDWithoutResetAfterMergeDelay(t *testing.T) {
 	}))
 	require.Empty(t, manager.reuse.pending)
 }
+
 func TestReclaimWaitsForDeletedNeighborAndMultipleRegions(t *testing.T) {
 	_, cluster, manager := newReuseTestManager(t)
 	for id := uint32(41); id <= 43; id++ {
@@ -140,7 +138,7 @@ func TestConcurrentClaimsUseDifferentBits(t *testing.T) {
 	results := make(chan result, 2)
 	for _, name := range []string{"tenant-one", "tenant-two"} {
 		go func(name string) {
-			meta, _, err := manager.tryCreateReusedKeyspace(name, map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, manager.reuse.now().Unix())
+			meta, err := manager.tryCreateReusedKeyspace(name, map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, manager.reuse.now().Unix())
 			results <- result{meta.GetId(), err}
 		}(name)
 	}
@@ -174,7 +172,6 @@ func TestReuseWatermarkSurvivesRestartWithoutNewAllocation(t *testing.T) {
 		return txn.Save(keypath.KeyspaceAllocIDPath(), string(typeutil.Uint64ToBytes(1000)))
 	}))
 	require.NoError(t, manager.StartIDReuse())
-	t.Cleanup(manager.StopIDReuse)
 	manager.RecordIDReuseCapability(1, reuseProtocolVersion)
 	require.NoError(t, manager.reuseAdmissionReady(region))
 }
@@ -183,10 +180,9 @@ func TestCMEKRequestLeavesFreeIDsForStarterReuse(t *testing.T) {
 	storage, cluster, manager := newReuseTestManager(t)
 	cluster.PutRegion(newReuseTestRegion(42, 42))
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
-	created, pending, err := manager.tryCreateReusedKeyspace("cmek-tenant", map[string]string{"encryption": `{"enabled":true,"vendor":"test","cmek_id":"test-customer-key"}`}, 1)
+	created, err := manager.tryCreateReusedKeyspace("cmek-tenant", map[string]string{"encryption": `{"enabled":true,"vendor":"test","cmek_id":"test-customer-key"}`}, 1)
 	require.NoError(t, err)
 	require.Nil(t, created)
-	require.Nil(t, pending)
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		bits, e := txn.Load(bitmapPath(0))
 		require.NotZero(t, bits[42/8]&(1<<(42%8)))
@@ -216,10 +212,9 @@ func TestClaimSkipsFreeIDThatNoLongerNeedsSplit(t *testing.T) {
 	// A later unrelated split isolates the range before Create claims the bit.
 	cluster.PutRegion(newReuseTestRegion(42, 42))
 	cluster.PutRegion(newReuseTestRegion(43, 43))
-	meta, pending, err := manager.tryCreateReusedKeyspace("isolated", nil, 1)
+	meta, err := manager.tryCreateReusedKeyspace("isolated", nil, 1)
 	require.NoError(t, err)
 	require.Nil(t, meta)
-	require.Nil(t, pending)
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		bits, err := txn.Load(bitmapPath(0))
 		require.NotZero(t, bits[42/8]&(1<<(42%8)))
