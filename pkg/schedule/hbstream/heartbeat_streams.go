@@ -47,8 +47,6 @@ type Operation struct {
 	SwitchWitnesses *pdpb.BatchSwitchWitness
 	// PD requires preventing the auto-splitting of this region.
 	ChangeSplit *pdpb.ChangeSplit
-	// RegionRequiresUpdate tells CSE to pull coherent keyspace state from PD.
-	RegionRequiresUpdate bool
 }
 
 // HeartbeatStream is an interface.
@@ -248,33 +246,31 @@ func (s *HeartbeatStreams) SendMsg(region *core.RegionInfo, op *Operation) {
 	switch s.typ {
 	case constant.SchedulingServiceName:
 		resp = &schedulingpb.RegionHeartbeatResponse{
-			Header:               &schedulingpb.ResponseHeader{ClusterId: s.clusterID},
-			RegionId:             region.GetID(),
-			RegionEpoch:          region.GetRegionEpoch(),
-			TargetPeer:           region.GetLeader(),
-			ChangePeer:           op.ChangePeer,
-			TransferLeader:       op.TransferLeader,
-			Merge:                op.Merge,
-			SplitRegion:          op.SplitRegion,
-			ChangePeerV2:         op.ChangePeerV2,
-			SwitchWitnesses:      op.SwitchWitnesses,
-			ChangeSplit:          op.ChangeSplit,
-			RegionRequiresUpdate: op.RegionRequiresUpdate,
+			Header:          &schedulingpb.ResponseHeader{ClusterId: s.clusterID},
+			RegionId:        region.GetID(),
+			RegionEpoch:     region.GetRegionEpoch(),
+			TargetPeer:      region.GetLeader(),
+			ChangePeer:      op.ChangePeer,
+			TransferLeader:  op.TransferLeader,
+			Merge:           op.Merge,
+			SplitRegion:     op.SplitRegion,
+			ChangePeerV2:    op.ChangePeerV2,
+			SwitchWitnesses: op.SwitchWitnesses,
+			ChangeSplit:     op.ChangeSplit,
 		}
 	default:
 		resp = &pdpb.RegionHeartbeatResponse{
-			Header:               &pdpb.ResponseHeader{ClusterId: s.clusterID},
-			RegionId:             region.GetID(),
-			RegionEpoch:          region.GetRegionEpoch(),
-			TargetPeer:           region.GetLeader(),
-			ChangePeer:           op.ChangePeer,
-			TransferLeader:       op.TransferLeader,
-			Merge:                op.Merge,
-			SplitRegion:          op.SplitRegion,
-			ChangePeerV2:         op.ChangePeerV2,
-			SwitchWitnesses:      op.SwitchWitnesses,
-			ChangeSplit:          op.ChangeSplit,
-			RegionRequiresUpdate: op.RegionRequiresUpdate,
+			Header:          &pdpb.ResponseHeader{ClusterId: s.clusterID},
+			RegionId:        region.GetID(),
+			RegionEpoch:     region.GetRegionEpoch(),
+			TargetPeer:      region.GetLeader(),
+			ChangePeer:      op.ChangePeer,
+			TransferLeader:  op.TransferLeader,
+			Merge:           op.Merge,
+			SplitRegion:     op.SplitRegion,
+			ChangePeerV2:    op.ChangePeerV2,
+			SwitchWitnesses: op.SwitchWitnesses,
+			ChangeSplit:     op.ChangeSplit,
 		}
 	}
 

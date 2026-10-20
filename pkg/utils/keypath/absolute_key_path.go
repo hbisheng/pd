@@ -95,8 +95,6 @@ const (
 	keyspaceMetaPrefixFormat    = "/pd/%d/keyspaces/meta/"                     // "/pd/{cluster_id}/keyspaces/meta/"
 	keyspaceMetaPathFormat      = "/pd/%d/keyspaces/meta/%08d"                 // "/pd/{cluster_id}/keyspaces/meta/{keyspace_id}"
 	keyspaceIDPathFormat        = "/pd/%d/keyspaces/id/%s"                     // "/pd/{cluster_id}/keyspaces/id/{keyspace_name}"
-	keyspaceResetPrefixFormat   = "/pd/%d/keyspaces/reset/"                    // "/pd/{cluster_id}/keyspaces/reset/"
-	keyspaceResetPathFormat     = "/pd/%d/keyspaces/reset/%08d"                // "/pd/{cluster_id}/keyspaces/reset/{keyspace_id}"
 	keyspaceFreePrefixFormat    = "/pd/%d/keyspaces/free/"                     // "/pd/{cluster_id}/keyspaces/free/"
 	keyspaceFreePathFormat      = "/pd/%d/keyspaces/free/%08d"                 // "/pd/{cluster_id}/keyspaces/free/{keyspace_id}"
 	keyspaceGroupIDPrefixFormat = "/pd/%d/tso/keyspace_groups/membership/"     // "/pd/{cluster_id}/tso/keyspace_groups/membership/"
@@ -233,16 +231,6 @@ func KeyspaceMetaPath(spaceID uint32) string {
 // KeyspaceIDPath returns the path to keyspace id from the given keyspace name.
 func KeyspaceIDPath(name string) string {
 	return fmt.Sprintf(keyspaceIDPathFormat, ClusterID(), name)
-}
-
-// KeyspaceResetPrefix returns the prefix for durable keyspace reset intents.
-func KeyspaceResetPrefix() string {
-	return fmt.Sprintf(keyspaceResetPrefixFormat, ClusterID())
-}
-
-// KeyspaceResetPath returns the path for a durable keyspace reset intent.
-func KeyspaceResetPath(id uint32) string {
-	return fmt.Sprintf(keyspaceResetPathFormat, ClusterID(), id)
 }
 
 // KeyspaceFreePrefix returns the prefix for reusable keyspace IDs.

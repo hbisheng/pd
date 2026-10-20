@@ -894,7 +894,7 @@ type KeyspaceConfig struct {
 	IDReuseThreshold uint64 `toml:"id-reuse-threshold" json:"id-reuse-threshold"`
 	// IDReuseMergeDelay allows tombstoned Regions time to merge before releasing IDs.
 	IDReuseMergeDelay typeutil.Duration `toml:"id-reuse-merge-delay" json:"id-reuse-merge-delay"`
-	// IDReuseWorkerInterval bounds pending reset notification and advancement.
+	// IDReuseWorkerInterval bounds background split-initialization retries.
 	IDReuseWorkerInterval typeutil.Duration `toml:"id-reuse-worker-interval" json:"id-reuse-worker-interval"`
 	// MetaServiceGroups is the available external meta-service groups.
 	// The key is the meta-service group name, and the value is the corresponding endpoint.

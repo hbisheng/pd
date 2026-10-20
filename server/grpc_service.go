@@ -44,7 +44,6 @@ import (
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/mcs/utils/constant"
 	"github.com/tikv/pd/pkg/ratelimit"
-	"github.com/tikv/pd/pkg/schedule/hbstream"
 	"github.com/tikv/pd/pkg/storage/kv"
 	"github.com/tikv/pd/pkg/utils/grpcutil"
 	"github.com/tikv/pd/pkg/utils/keypath"
@@ -1429,9 +1428,6 @@ func (s *GrpcServer) RegionHeartbeat(stream pdpb.PD_RegionHeartbeatServer) error
 		regionHeartbeatHandleDuration.WithLabelValues(storeAddress, storeLabel).Observe(time.Since(start).Seconds())
 		regionHeartbeatCounter.WithLabelValues(storeAddress, storeLabel, "report", "ok").Inc()
 		s.GetKeyspaceManager().RecordRegionStorageState(region, request.GetStorageState())
-		if s.GetKeyspaceManager().KeyspaceUpdateRequiredForRegion(region.GetID()) {
-			s.hbStreams.SendMsg(region, &hbstream.Operation{RegionRequiresUpdate: true})
-		}
 
 		if rc.IsServiceIndependent(constant.SchedulingServiceName) {
 			if forwardErrCh != nil {

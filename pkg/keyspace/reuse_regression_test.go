@@ -16,6 +16,7 @@ package keyspace
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -57,63 +58,6 @@ func (t *reuseHookTxn) LoadRange(key, end string, limit int) ([]string, []string
 	return t.Txn.LoadRange(key, end, limit)
 }
 
-func TestSplitBeforeClaimRequiresEncryptionInitialization(t *testing.T) {
-	backend := &reuseHookKV{Base: kv.NewMemoryKV()}
-	storage, cluster, manager := newReuseTestManagerWithKV(t, backend)
-	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
-	backend.onSave = func(key string) {
-		if key != keypath.KeyspaceMetaPath(42) {
-			return
-		}
-		backend.onSave = nil
-		persisted, err := backend.Base.Load(key)
-		require.NoError(t, err)
-		require.Empty(t, persisted)
-		// Another split queried the config before this claim became visible.
-		cluster.PutRegion(newReuseTestRegion(42, 42))
-		cluster.PutRegion(newReuseTestRegion(43, 43))
-	}
-	manager.SetKeyspaceUpdateNotifier(func(r *core.RegionInfo) {
-		manager.RecordRegionStorageState(r, &pdpb.RegionStorageState{Encrypted: false})
-	})
-	created, pending, err := manager.tryCreateReusedKeyspace("encrypted-race", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic", "encryption": `{"enabled":true}`}, manager.reuse.now().Unix())
-	require.NoError(t, err)
-	require.NotNil(t, pending)
-	require.Equal(t, keyspacepb.KeyspaceState_DISABLED, created.State)
-	require.NotZero(t, created.PendingResetVersion)
-	manager.RecordRegionStorageState(cluster.GetRegion(42), &pdpb.RegionStorageState{RestoreVersion: created.PendingResetVersion, Encrypted: true})
-	manager.SetKeyspaceUpdateNotifier(nil)
-	manager.advanceReuseTask(42)
-	current, err := manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, current.State)
-}
-
-func TestEncryptedSplitNeedsAppliedReportButNoResetVersion(t *testing.T) {
-	backend := &reuseHookKV{Base: kv.NewMemoryKV()}
-	storage, cluster, manager := newReuseTestManagerWithKV(t, backend)
-	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
-	backend.onSave = func(key string) {
-		if key != keypath.KeyspaceMetaPath(42) {
-			return
-		}
-		backend.onSave = nil
-		cluster.PutRegion(newReuseTestRegion(42, 42))
-		cluster.PutRegion(newReuseTestRegion(43, 43))
-	}
-	manager.SetResetVersionAllocator(func(context.Context) (uint64, error) { t.Error("correct split must not allocate T"); return 0, nil })
-	manager.SetKeyspaceUpdateNotifier(func(r *core.RegionInfo) {
-		manager.RecordRegionStorageState(r, &pdpb.RegionStorageState{Encrypted: true})
-	})
-	created, pending, err := manager.tryCreateReusedKeyspace("encrypted-split", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic", "encryption": `{"enabled":true}`}, manager.reuse.now().Unix())
-	require.NoError(t, err)
-	require.Nil(t, pending)
-	require.Zero(t, created.PendingResetVersion)
-	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, created.State)
-}
-
 func TestFreeBitmapScanReachesLaterEligibleBucket(t *testing.T) {
 	storage, cluster, manager := newReuseTestManager(t)
 	for bucket := uint32(0); bucket <= 32; bucket++ {
@@ -121,7 +65,7 @@ func TestFreeBitmapScanReachesLaterEligibleBucket(t *testing.T) {
 		require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, id, true) }))
 	}
 	eligible := uint32(32*256 + 42)
-	cluster.PutRegion(newReuseTestRegion(eligible, uint64(eligible)))
+	cluster.PutRegion(newReuseTestRegion(eligible, uint64(eligible)).Clone(core.WithEndKey(MakeRegionBound(eligible + 1).TxnRightBound)))
 	created, _, err := manager.tryCreateReusedKeyspace("first-page", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
 	require.NoError(t, err)
 	require.Nil(t, created)
@@ -155,6 +99,7 @@ func TestStartupPagesFitDefaultEtcdBudget(t *testing.T) {
 func TestNameRevisionIsAtomicAndRecovered(t *testing.T) {
 	storage, cluster, manager := newReuseTestManager(t)
 	prepareIsolatedReuse(t, manager, cluster)
+	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
 	require.Equal(t, uint64(1), manager.KeyspaceNameRevision())
 	created, _, err := manager.tryCreateReusedKeyspace("new-name", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
@@ -165,7 +110,7 @@ func TestNameRevisionIsAtomicAndRecovered(t *testing.T) {
 		require.Equal(t, uint64(2), revision)
 		return err
 	}))
-	require.NotZero(t, created.PendingResetVersion)
+	require.True(t, created.PendingInitialization)
 	require.NoError(t, manager.StartIDReuse())
 	t.Cleanup(manager.StopIDReuse)
 	require.Equal(t, uint64(2), manager.KeyspaceNameRevision())
@@ -178,7 +123,9 @@ func TestReuseRequiresCacheProtocolOnAllStores(t *testing.T) {
 	cluster.AddRegionStore(2, 0)
 	cluster.AddLabelsStore(3, 0, map[string]string{"engine": "tiflash"})
 	require.Error(t, manager.reuseAdmissionReady(newReuseTestRegion(42, 42)))
-	manager.RecordIDReuseCapability(2, 4)
+	manager.RecordIDReuseCapability(2, reuseProtocolVersion-1)
+	require.Error(t, manager.reuseAdmissionReady(newReuseTestRegion(42, 42)))
+	manager.RecordIDReuseCapability(2, reuseProtocolVersion)
 	require.NoError(t, manager.reuseAdmissionReady(newReuseTestRegion(42, 42)))
 }
 
@@ -218,62 +165,73 @@ func TestNameBroadcastIsBoundedAndSurvivesMissedHistory(t *testing.T) {
 	require.True(t, all)
 }
 
-func TestEncryptedSplitWithoutAppliedReportStaysDisabled(t *testing.T) {
-	backend := &reuseHookKV{Base: kv.NewMemoryKV()}
-	storage, cluster, manager := newReuseTestManagerWithKV(t, backend)
-	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
-	backend.onSave = func(key string) {
-		if key != keypath.KeyspaceMetaPath(42) {
-			return
-		}
-		backend.onSave = nil
-		cluster.PutRegion(newReuseTestRegion(42, 42))
-		cluster.PutRegion(newReuseTestRegion(43, 43))
+func TestSplitBeforeClaimDoesNotEnableWrongEncryption(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(strconv.FormatBool(encrypted), func(t *testing.T) {
+			backend := &reuseHookKV{Base: kv.NewMemoryKV()}
+			storage, cluster, manager := newReuseTestManagerWithKV(t, backend)
+			cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
+			require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
+			backend.onSave = func(key string) {
+				if key != keypath.KeyspaceMetaPath(42) {
+					return
+				}
+				backend.onSave = nil
+				// An unrelated split fetched configuration before the claim was committed.
+				cluster.PutRegion(newReuseTestRegion(42, 42))
+				cluster.PutRegion(newReuseTestRegion(43, 43))
+			}
+			config := map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}
+			if encrypted {
+				config["encryption"] = `{"enabled":true}`
+			}
+			claimed, _, err := manager.tryCreateReusedKeyspace("racing-split", config, 1)
+			require.NoError(t, err)
+			manager.RecordRegionStorageState(cluster.GetRegion(42), &pdpb.RegionStorageState{Encrypted: !encrypted})
+			manager.advanceReuseTask(42)
+			_, err = manager.waitReusedCreate(claimed)
+			require.Error(t, err)
+			current, err := manager.LoadKeyspaceByID(42)
+			require.NoError(t, err)
+			require.Equal(t, keyspacepb.KeyspaceState_DISABLED, current.State)
+			require.True(t, current.PendingInitialization)
+			// There is no reset fallback; the control plane can cancel normally.
+			_, err = manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_ARCHIVED, 2)
+			require.NoError(t, err)
+		})
 	}
-	manager.SetResetVersionAllocator(func(context.Context) (uint64, error) {
-		t.Error("unknown actual state must not trigger a reset")
-		return 0, nil
-	})
-	_, _, err := manager.tryCreateReusedKeyspace("unknown-encryption", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic", "encryption": `{"enabled":true}`}, 1)
-	require.Error(t, err)
-	meta, err := manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_DISABLED, meta.State)
-	require.Zero(t, meta.PendingResetVersion)
-	require.True(t, meta.PendingInitialization)
-	require.True(t, manager.KeyspaceUpdateRequiredForRegion(42))
-
-	// A timeout does not cancel initialization; a later applied report completes it.
-	manager.RecordRegionStorageState(cluster.GetRegion(42), &pdpb.RegionStorageState{Encrypted: true})
-	manager.advanceReuseTask(42)
-	meta, err = manager.LoadKeyspaceByID(42)
-	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, meta.State)
-	require.False(t, meta.PendingInitialization)
-	require.Zero(t, meta.PendingResetVersion)
-	require.False(t, manager.KeyspaceUpdateRequiredForRegion(42))
 }
 
-func TestPlainSplitWithStaleEncryptionFallsBackToReset(t *testing.T) {
-	backend := &reuseHookKV{Base: kv.NewMemoryKV()}
-	storage, cluster, manager := newReuseTestManagerWithKV(t, backend)
-	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
-	backend.onSave = func(key string) {
-		if key != keypath.KeyspaceMetaPath(42) {
-			return
-		}
-		backend.onSave = nil
-		cluster.PutRegion(newReuseTestRegion(42, 42))
-		cluster.PutRegion(newReuseTestRegion(43, 43))
+func TestSplitCompletionRequiresFreshAppliedEncryption(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(strconv.FormatBool(encrypted), func(t *testing.T) {
+			storage, cluster, manager := newReuseTestManager(t)
+			cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
+			require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
+			config := map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}
+			if encrypted {
+				config["encryption"] = `{"enabled":true}`
+			}
+			claimed, _, err := manager.tryCreateReusedKeyspace("split", config, 1)
+			require.NoError(t, err)
+			region := newReuseTestRegion(42, 42)
+			cluster.PutRegion(region)
+			cluster.PutRegion(newReuseTestRegion(43, 43))
+			manager.advanceReuseTask(42)
+			manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{Encrypted: encrypted})
+			// A leader/epoch change invalidates the cached report.
+			region = region.Clone(core.WithIncVersion())
+			cluster.PutRegion(region)
+			manager.advanceReuseTask(42)
+			current, err := manager.LoadKeyspaceByID(42)
+			require.NoError(t, err)
+			require.Equal(t, keyspacepb.KeyspaceState_DISABLED, current.State)
+			manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{Encrypted: encrypted})
+			manager.advanceReuseTask(42)
+			current, err = manager.waitReusedCreate(claimed)
+			require.NoError(t, err)
+			require.Equal(t, keyspacepb.KeyspaceState_ENABLED, current.State)
+			require.False(t, current.PendingInitialization)
+		})
 	}
-	manager.SetKeyspaceUpdateNotifier(func(region *core.RegionInfo) {
-		manager.RecordRegionStorageState(region, &pdpb.RegionStorageState{Encrypted: true})
-	})
-	created, pending, err := manager.tryCreateReusedKeyspace("plain-stale-key", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
-	require.NoError(t, err)
-	require.NotNil(t, pending)
-	require.Equal(t, keyspacepb.KeyspaceState_DISABLED, created.State)
-	require.NotZero(t, created.PendingResetVersion)
 }

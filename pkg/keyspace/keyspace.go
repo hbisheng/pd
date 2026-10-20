@@ -303,7 +303,7 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 	}
 	tracer.OnGetConfigFinished()
 
-	// Reused Create either follows split initialization or waits for a fixed reset.
+	// Reused Create waits for the existing split initialization to finish.
 	reused, task, err := manager.tryCreateReusedKeyspace(request.Name, request.Config, request.CreateTime)
 	if err != nil {
 		return nil, err
@@ -1183,7 +1183,6 @@ func (manager *Manager) transformKeyspaceState(txn kv.Txn, meta *keyspacepb.Keys
 		return errors.New("reused keyspace initialization has not completed")
 	}
 	if newState == keyspacepb.KeyspaceState_ARCHIVED {
-		meta.PendingResetVersion = 0
 		meta.PendingInitialization = false
 	}
 	// If already in the target state, do nothing and return. A TOMBSTONE keyspace
