@@ -239,3 +239,27 @@ func TestClaimMutexCoversCommittedMetadataBeforePendingCache(t *testing.T) {
 	require.Equal(t, uint32(43), second.GetId())
 	require.Contains(t, manager.reuse.pending, uint32(43))
 }
+
+func TestClaimBoundsEtcdComparisonsAcrossBlockedRegions(t *testing.T) {
+	_, client, clean := etcdutil.NewTestEtcdCluster(t, 1, nil)
+	t.Cleanup(clean)
+	storage, cluster, manager := newReuseTestManagerWithKV(t, kv.NewEtcdKVBase(client))
+	// Each blocked Region exhausts the bounded lower-metadata scan. Combining
+	// these checks in one transaction would exceed etcd's default 128-op limit.
+	for bucket := uint32(0); bucket < 5; bucket++ {
+		first := bucket*256 + 1
+		for id := first; id < first+freeIDScanLimit; id++ {
+			saveReuseTestMeta(t, manager, id, keyspacepb.KeyspaceState_ENABLED)
+		}
+		candidate := bucket*256 + 42
+		cluster.PutRegion(newReuseTestRegion(first, uint64(first)).Clone(core.WithEndKey(MakeRegionBound(candidate + 1).TxnRightBound)))
+		require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, candidate, true) }))
+	}
+	const eligible = uint32(5*256 + 42)
+	cluster.PutRegion(newReuseTestRegion(eligible, uint64(eligible)).Clone(core.WithEndKey(MakeRegionBound(eligible + 1).TxnRightBound)))
+	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, eligible, true) }))
+	created, err := manager.tryCreateReusedKeyspace("after-blocked-regions", nil, 1)
+	require.NoError(t, err)
+	require.NotNil(t, created)
+	require.Equal(t, eligible, created.GetId())
+}
