@@ -342,8 +342,10 @@ func firstRegionKeyspace(region *core.RegionInfo) uint32 {
 }
 
 // lowerTombstonesReclaimed bounds work even if Cleaner requests IDs out of order.
-// Reclaimed metadata is deleted, so ascending reclamation skips holes cheaply.
-func (manager *Manager) lowerTombstonesReclaimed(txn kv.Txn, region *core.RegionInfo, id uint32) (bool, error) {
+// A tombstone before an unallocated hole is retained, but does not block the
+// next deleted group. lowerFreeChecked means the caller already proved there
+// are no free IDs below id; id itself is the free candidate being claimed.
+func (manager *Manager) lowerTombstonesReclaimed(txn kv.Txn, region *core.RegionInfo, id uint32, lowerFreeChecked bool) (bool, error) {
 	_, values, err := txn.LoadRange(keypath.KeyspaceMetaPath(firstRegionKeyspace(region)), keypath.KeyspaceMetaPath(id), freeIDScanLimit)
 	if err != nil {
 		return false, err
@@ -353,7 +355,34 @@ func (manager *Manager) lowerTombstonesReclaimed(txn kv.Txn, region *core.Region
 		if err := proto.Unmarshal([]byte(value), meta); err != nil {
 			return false, err
 		}
-		if meta.State == keyspacepb.KeyspaceState_TOMBSTONE {
+		if meta.State != keyspacepb.KeyspaceState_TOMBSTONE {
+			continue
+		}
+		// Explicitly read even an absent neighbor: ordinary creation does not
+		// advance name_revision, so its insertion needs this missing-key CAS.
+		nextID := meta.GetId() + 1
+		next, err := manager.store.LoadKeyspaceMeta(txn, nextID)
+		if err != nil || next != nil {
+			return false, err
+		}
+		if lowerFreeChecked {
+			if nextID == id {
+				return false, nil
+			}
+			continue
+		}
+		width := uint32(manager.bitmapBytes() * 8)
+		bits, err := txn.Load(bitmapPath(nextID / width))
+		if err != nil {
+			return false, err
+		}
+		if bits == "" {
+			continue
+		}
+		if len(bits) != manager.bitmapBytes() {
+			return false, errors.New("invalid free bitmap encoding")
+		}
+		if bits[(nextID%width)/8]&(1<<(nextID%8)) != 0 {
 			return false, nil
 		}
 	}
@@ -616,7 +645,7 @@ func (manager *Manager) releaseReclaimedID(expected *keyspacepb.KeyspaceMeta, re
 		} else if next.State != keyspacepb.KeyspaceState_TOMBSTONE {
 			return nil
 		}
-		ready, err := manager.lowerTombstonesReclaimed(txn, region, expected.GetId())
+		ready, err := manager.lowerTombstonesReclaimed(txn, region, expected.GetId(), false)
 		if err != nil || !ready {
 			return err
 		}
@@ -773,11 +802,13 @@ func (manager *Manager) claimReusedKeyspace(id uint32, name string, config map[s
 			if bits[(id%width)/8]&(1<<(id%8)) == 0 {
 				return nil
 			}
-			ready, err := manager.lowerTombstonesReclaimed(txn, region, id)
+			// Check free bits first so lower tombstone checks can reuse this
+			// proof without extra bitmap reads and stay within etcd's op limit.
+			ready, err := manager.lowerFreeIDsClaimed(txn, region, id)
 			if err != nil || !ready {
 				return err
 			}
-			ready, err = manager.lowerFreeIDsClaimed(txn, region, id)
+			ready, err = manager.lowerTombstonesReclaimed(txn, region, id, true)
 			if err != nil || !ready {
 				return err
 			}

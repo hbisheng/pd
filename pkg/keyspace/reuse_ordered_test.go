@@ -75,10 +75,19 @@ func TestReclaimOrdersTombstonesAcrossMetadataHoles(t *testing.T) {
 	_, err := manager.LoadKeyspaceByID(80)
 	require.NoError(t, err)
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
-	// 43 has no deleted/free immediate right neighbor, so it still blocks 80.
+	// Retain 43 before the unallocated hole, but allow the next deleted group.
 	require.NoError(t, manager.RequestKeyspaceReclaim(80))
 	_, err = manager.LoadKeyspaceByID(80)
+	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
+	require.NoError(t, manager.RequestKeyspaceReclaim(43))
+	_, err = manager.LoadKeyspaceByID(43)
 	require.NoError(t, err)
+	first, err := manager.tryCreateReusedKeyspace("before-hole", nil, 1)
+	require.NoError(t, err)
+	require.Equal(t, uint32(42), first.GetId())
+	next, err := manager.tryCreateReusedKeyspace("after-hole", nil, 1)
+	require.NoError(t, err)
+	require.Equal(t, uint32(80), next.GetId())
 }
 
 func TestLowerMetadataScanDefersAtBound(t *testing.T) {
@@ -89,7 +98,7 @@ func TestLowerMetadataScanDefersAtBound(t *testing.T) {
 	region := newReuseTestRegion(1, 420).Clone(core.WithEndKey(MakeRegionBound(100).TxnRightBound))
 	cluster.PutRegion(region)
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		ready, err := manager.lowerTombstonesReclaimed(txn, region, 99)
+		ready, err := manager.lowerTombstonesReclaimed(txn, region, 99, false)
 		require.False(t, ready)
 		return err
 	}))
@@ -147,6 +156,7 @@ func TestClaimWaitsForLowerTombstoneAfterRegionsMerge(t *testing.T) {
 type orderedReuseKV struct {
 	kv.Base
 	afterRange  func(string)
+	afterLoad   func(string)
 	afterCommit func()
 }
 type orderedReuseTxn struct {
@@ -262,4 +272,43 @@ func TestClaimBoundsEtcdComparisonsAcrossBlockedRegions(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, created)
 	require.Equal(t, eligible, created.GetId())
+}
+
+func (t *orderedReuseTxn) Load(key string) (string, error) {
+	value, err := t.Txn.Load(key)
+	if err == nil && t.owner.afterLoad != nil {
+		t.owner.afterLoad(key)
+	}
+	return value, err
+}
+
+func TestClaimRejectsConcurrentCreationInMetadataHole(t *testing.T) {
+	_, client, clean := etcdutil.NewTestEtcdCluster(t, 1, nil)
+	t.Cleanup(clean)
+	backend := &orderedReuseKV{Base: kv.NewEtcdKVBase(client)}
+	storage, cluster, manager := newReuseTestManagerWithKV(t, backend)
+	saveReuseTestMeta(t, manager, 42, keyspacepb.KeyspaceState_TOMBSTONE)
+	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(81).TxnRightBound)))
+	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 80, true) }))
+	injected := false
+	backend.afterLoad = func(key string) {
+		if key != keypath.KeyspaceMetaPath(43) || injected {
+			return
+		}
+		injected = true
+		// Ordinary creation fills the hole without changing name_revision. The
+		// claim must conflict on its absent-neighbor read, then defer on retry.
+		require.NoError(t, backend.Base.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+			return manager.store.SaveKeyspaceMeta(txn, &keyspacepb.KeyspaceMeta{
+				Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: 43}, Name: "fills-hole", State: keyspacepb.KeyspaceState_DISABLED,
+			})
+		}))
+	}
+	created, err := manager.tryCreateReusedKeyspace("after-hole", nil, 1)
+	require.NoError(t, err)
+	require.True(t, injected)
+	require.Nil(t, created)
+	require.Zero(t, manager.KeyspaceNameRevision())
+	_, err = manager.LoadKeyspaceByID(80)
+	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
 }
