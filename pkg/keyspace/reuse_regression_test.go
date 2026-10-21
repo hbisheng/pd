@@ -23,7 +23,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/storage/kv"
-	"github.com/tikv/pd/pkg/utils/etcdutil"
 	"github.com/tikv/pd/pkg/utils/keypath"
 )
 
@@ -73,24 +72,14 @@ func TestFreeBitmapScanReachesLaterEligibleBucket(t *testing.T) {
 	require.Equal(t, eligible, created.GetId())
 }
 
-func TestDisabledReuseDoesNotScanMetadata(t *testing.T) {
+func TestReuseStartupDoesNotScanMetadata(t *testing.T) {
 	backend := &reuseHookKV{Base: kv.NewMemoryKV()}
 	_, _, manager := newReuseTestManagerWithKV(t, backend)
-	manager.config.(*mockConfig).EnableIDReuse = false
-	require.NoError(t, manager.StartIDReuse())
-	require.Zero(t, backend.scans)
-}
-
-func TestStartupPagesFitDefaultEtcdBudget(t *testing.T) {
-	_, client, clean := etcdutil.NewTestEtcdCluster(t, 1, nil)
-	t.Cleanup(clean)
-	_, _, manager := newReuseTestManagerWithKV(t, kv.NewEtcdKVBase(client))
-	for id := uint32(1); id <= 500; id++ {
-		saveReuseTestMeta(t, manager, id, keyspacepb.KeyspaceState_ENABLED)
+	for _, enabled := range []bool{true, false} {
+		manager.config.(*mockConfig).EnableIDReuse = enabled
+		require.NoError(t, manager.StartIDReuse())
+		require.Zero(t, backend.scans)
 	}
-	require.NoError(t, manager.StartIDReuse())
-	manager.config.(*mockConfig).EnableIDReuse = false
-	require.NoError(t, manager.StartIDReuse())
 }
 
 func TestNameRevisionIsAtomicAndRecovered(t *testing.T) {
@@ -99,7 +88,7 @@ func TestNameRevisionIsAtomicAndRecovered(t *testing.T) {
 	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
 	require.Equal(t, uint64(1), manager.KeyspaceNameRevision())
-	created, err := manager.tryCreateReusedKeyspace("new-name", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
+	_, err := manager.tryCreateReusedKeyspace("new-name", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), manager.KeyspaceNameRevision())
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
@@ -107,7 +96,6 @@ func TestNameRevisionIsAtomicAndRecovered(t *testing.T) {
 		require.Equal(t, uint64(2), revision)
 		return err
 	}))
-	require.True(t, created.PendingInitialization)
 	require.NoError(t, manager.StartIDReuse())
 	require.Equal(t, uint64(2), manager.KeyspaceNameRevision())
 	manager.publishNameRevision(1, 42)
@@ -180,5 +168,4 @@ func TestSplitBeforeClaimIsCanceledWithoutInitialization(t *testing.T) {
 	current, err := manager.LoadKeyspaceByID(42)
 	require.NoError(t, err)
 	require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, current.State)
-	require.False(t, current.PendingInitialization)
 }

@@ -124,7 +124,6 @@ func TestClaimsPreserveRegionOrderAcrossBitmapPagesWithoutWaitingForSplits(t *te
 		require.NoError(t, err)
 		require.NotNil(t, created)
 		require.Equal(t, bucket*256+42, created.GetId())
-		require.True(t, created.PendingInitialization)
 	}
 	require.Len(t, manager.reuse.pending, 2)
 }

@@ -942,9 +942,6 @@ func (manager *Manager) updateKeyspaceConfigTxn(name string, update func(meta *k
 		if meta == nil {
 			return errs.ErrKeyspaceNotFound
 		}
-		if isReuseInitializing(meta) {
-			return errors.New("cannot change configuration during keyspace initialization")
-		}
 		// Only keyspace with state listed in allowChangeConfig are allowed to change their config.
 		if !slice.Contains(allowChangeConfig, meta.GetState()) {
 			return errors.Errorf("cannot change config for keyspace with state %s", meta.GetState().String())
@@ -1175,12 +1172,6 @@ func (manager *Manager) unassignKeyspaceFromMetaServiceGroup(txn kv.Txn, meta *k
 
 // transformKeyspaceState transforms the keyspace state to the target state and record the update time.
 func (manager *Manager) transformKeyspaceState(txn kv.Txn, meta *keyspacepb.KeyspaceMeta, newState keyspacepb.KeyspaceState, now int64) error {
-	if isReuseInitializing(meta) && newState == keyspacepb.KeyspaceState_ENABLED {
-		return errors.New("reused keyspace initialization has not completed")
-	}
-	if newState == keyspacepb.KeyspaceState_ARCHIVED {
-		meta.PendingInitialization = false
-	}
 	// If already in the target state, do nothing and return. A TOMBSTONE keyspace
 	// still carrying a meta-service group binding (e.g. one tombstoned before this
 	// cleanup existed) is repaired here by re-applying the TOMBSTONE update; the

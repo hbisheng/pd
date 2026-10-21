@@ -37,7 +37,6 @@ import (
 	"github.com/tikv/pd/pkg/schedule/labeler"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
-	"github.com/tikv/pd/pkg/utils/etcdutil"
 	"github.com/tikv/pd/pkg/utils/keypath"
 	"github.com/tikv/pd/pkg/utils/typeutil"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -89,9 +88,16 @@ func cloneKeyspaceConfig(config map[string]string) map[string]string {
 	return result
 }
 
-// isReuseInitializing protects creation until the existing split flow completes.
-func isReuseInitializing(meta *keyspacepb.KeyspaceMeta) bool {
-	return meta != nil && meta.State == keyspacepb.KeyspaceState_DISABLED && meta.PendingInitialization
+// isReuseInitializing recognizes only claims made by this manager. A normal
+// DISABLED keyspace is not a pending reuse creation.
+func (manager *Manager) isReuseInitializing(meta *keyspacepb.KeyspaceMeta) bool {
+	if meta == nil || meta.State != keyspacepb.KeyspaceState_DISABLED {
+		return false
+	}
+	manager.reuse.mu.RLock()
+	defer manager.reuse.mu.RUnlock()
+	pending := manager.reuse.pending[meta.GetId()]
+	return pending != nil && pending.Name == meta.Name && pending.CreatedAt == meta.CreatedAt
 }
 
 func reusableKeyspaceID(id uint32) bool {
@@ -124,19 +130,16 @@ func (manager *Manager) supportsReuseEncryption(config map[string]string) bool {
 func (manager *Manager) cacheReuseMeta(meta *keyspacepb.KeyspaceMeta) {
 	manager.reuse.mu.Lock()
 	defer manager.reuse.mu.Unlock()
-	if isReuseInitializing(meta) {
-		copy := *meta
-		copy.Config = cloneKeyspaceConfig(meta.Config)
-		manager.reuse.pending[meta.GetId()] = &copy
-	} else {
+	pending := manager.reuse.pending[meta.GetId()]
+	if meta.State != keyspacepb.KeyspaceState_DISABLED || (pending != nil && (pending.Name != meta.Name || pending.CreatedAt != meta.CreatedAt || !maps.Equal(pending.Config, meta.Config))) {
 		delete(manager.reuse.pending, meta.GetId())
 		delete(manager.reuse.grants, meta.GetId())
 	}
 	manager.keyspaceStateLookup.Store(meta.GetId(), meta.State)
 }
 
-// StartIDReuse reloads allocator/cache revisions and cancels interrupted creations.
-// Without the original split grant, boundaries alone cannot prove initialization.
+// StartIDReuse reloads allocator/cache revisions. Interrupted Creates remain
+// DISABLED for the control plane to handle through the ordinary lifecycle.
 func (manager *Manager) StartIDReuse() error {
 	// The allocator's in-memory window starts at zero after restart. Read its
 	// existing durable counter once, rather than requiring a new allocation.
@@ -167,24 +170,6 @@ func (manager *Manager) StartIDReuse() error {
 	manager.reuse.mu.Unlock()
 	if !manager.config.IsIDReuseEnabled() {
 		return nil
-	}
-	var start uint32
-	for {
-		metas, err := manager.LoadRangeKeyspace(start, etcdutil.MaxEtcdTxnOps)
-		if err != nil {
-			return err
-		}
-		for _, meta := range metas {
-			if isReuseInitializing(meta) {
-				if err := manager.cancelReusedCreate(meta); err != nil {
-					return err
-				}
-			}
-		}
-		if len(metas) < etcdutil.MaxEtcdTxnOps {
-			break
-		}
-		start = metas[len(metas)-1].GetId() + 1
 	}
 	return manager.ensureBitmapLayout()
 }
@@ -486,7 +471,7 @@ func (manager *Manager) ensureReuseRegionRule(expected *keyspacepb.KeyspaceMeta)
 	if err != nil {
 		return err
 	}
-	if !isReuseInitializing(current) || current.Name != expected.Name || current.CreatedAt != expected.CreatedAt || !maps.Equal(current.Config, expected.Config) {
+	if !manager.isReuseInitializing(current) || current.Name != expected.Name || current.CreatedAt != expected.CreatedAt || !maps.Equal(current.Config, expected.Config) {
 		return errors.New("pending creation changed before installing boundaries")
 	}
 	cluster, ok := manager.cluster.(interface{ GetRegionLabeler() *labeler.RegionLabeler })
@@ -513,7 +498,7 @@ func (manager *Manager) completeReusedCreate(expected *keyspacepb.KeyspaceMeta) 
 		if err != nil {
 			return err
 		}
-		if meta == nil || meta.Name != expected.Name || meta.CreatedAt != expected.CreatedAt || !isReuseInitializing(meta) || !maps.Equal(meta.Config, expected.Config) {
+		if meta == nil || meta.Name != expected.Name || meta.CreatedAt != expected.CreatedAt || !manager.isReuseInitializing(meta) || !maps.Equal(meta.Config, expected.Config) {
 			return errors.New("pending creation changed")
 		}
 		if manager.kgm != nil {
@@ -522,7 +507,6 @@ func (manager *Manager) completeReusedCreate(expected *keyspacepb.KeyspaceMeta) 
 			}
 		}
 		meta.State = keyspacepb.KeyspaceState_ENABLED
-		meta.PendingInitialization = false
 		meta.StateChangedAt = manager.reuse.now().Unix()
 		completed = meta
 		return manager.store.SaveKeyspaceMeta(txn, meta)
@@ -544,7 +528,7 @@ func (manager *Manager) cancelReusedCreate(expected *keyspacepb.KeyspaceMeta) er
 		if err != nil {
 			return err
 		}
-		if meta == nil || meta.Name != expected.Name || meta.CreatedAt != expected.CreatedAt || !isReuseInitializing(meta) {
+		if meta == nil || meta.Name != expected.Name || meta.CreatedAt != expected.CreatedAt || !manager.isReuseInitializing(meta) {
 			return nil
 		}
 		if err := manager.transformKeyspaceState(txn, meta, keyspacepb.KeyspaceState_ARCHIVED, manager.reuse.now().Unix()); err != nil {
@@ -757,6 +741,11 @@ func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]s
 					continue
 				}
 				manager.publishNameRevision(revision, meta.GetId())
+				manager.reuse.mu.Lock()
+				pending := *meta
+				pending.Config = cloneKeyspaceConfig(meta.Config)
+				manager.reuse.pending[meta.GetId()] = &pending
+				manager.reuse.mu.Unlock()
 				manager.cacheReuseMeta(meta)
 				manager.keyspaceNameLookup.Store(meta.GetId(), name)
 				if err := manager.ensureReuseRegionRule(meta); err != nil {
@@ -826,7 +815,7 @@ func (manager *Manager) claimReusedKeyspace(id uint32, name string, config map[s
 			if old != nil {
 				return errs.ErrEtcdTxnConflict
 			}
-			meta = &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: name, Config: cloneKeyspaceConfig(config), State: keyspacepb.KeyspaceState_DISABLED, PendingInitialization: true, CreatedAt: createTime, StateChangedAt: createTime}
+			meta = &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: name, Config: cloneKeyspaceConfig(config), State: keyspacepb.KeyspaceState_DISABLED, CreatedAt: createTime, StateChangedAt: createTime}
 			if err := manager.changeFreeBit(txn, id, false); err != nil {
 				return err
 			}

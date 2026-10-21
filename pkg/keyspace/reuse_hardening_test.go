@@ -57,7 +57,6 @@ func TestSplitCompletionRequiresMatchingGrantAndReport(t *testing.T) {
 	current, err = manager.waitReusedCreate(pending)
 	require.NoError(t, err)
 	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, current.State)
-	require.False(t, current.PendingInitialization)
 	require.Empty(t, manager.reuse.grants)
 }
 
@@ -86,7 +85,6 @@ func TestReusedCreateTimeoutArchivesAndKeepsIDClaimed(t *testing.T) {
 	current, err := manager.LoadKeyspaceByID(42)
 	require.NoError(t, err)
 	require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, current.State)
-	require.False(t, current.PendingInitialization)
 	require.NotNil(t, cluster.GetRegionLabeler().GetLabelRule(buildLabelRule(42, txnRegionBound).ID))
 	require.NoError(t, manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		bits, err := txn.Load(bitmapPath(0))
@@ -107,23 +105,32 @@ func TestOldSplitCannotCompleteNewClaim(t *testing.T) {
 	require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, current.State)
 }
 
-func TestPendingSplitCannotBypassInitializationAndRestartCancels(t *testing.T) {
+func TestRestartLeavesInterruptedCreateDisabled(t *testing.T) {
 	_, manager, pending, _ := claimSplitReuse(t)
-	_, err := manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_ENABLED, 2)
-	require.Error(t, err)
-	mutations := []*Mutation{{Op: OpPut, Key: "encryption", Value: `{"enabled":true}`}}
-	_, err = manager.UpdateKeyspaceConfig(pending.Name, mutations)
-	require.Error(t, err)
-	_, err = manager.UpdateKeyspaceConfigWithPreconditions(pending.Name, mutations, map[string]*string{"encryption": nil})
-	require.Error(t, err)
 	manager.reuse = newReuseState()
 	require.NoError(t, manager.StartIDReuse())
 	current, err := manager.LoadKeyspaceByID(42)
 	require.NoError(t, err)
-	require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, current.State)
-	require.False(t, current.PendingInitialization)
+	require.Equal(t, keyspacepb.KeyspaceState_DISABLED, current.State)
+	require.Empty(t, manager.reuse.pending)
 	require.Error(t, manager.ensureReuseRegionRule(pending))
 	require.Error(t, manager.completeReusedCreate(pending))
+	_, err = manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_ARCHIVED, 2)
+	require.NoError(t, err)
+}
+
+func TestDisabledKeyspaceUsesOrdinaryStateAndConfigUpdates(t *testing.T) {
+	_, manager, pending, _ := claimSplitReuse(t)
+	mutations := []*Mutation{{Op: OpPut, Key: "encryption", Value: `{"enabled":true}`}}
+	_, err := manager.UpdateKeyspaceConfig(pending.Name, mutations)
+	require.NoError(t, err)
+	// A delayed completion must not apply the old creation configuration.
+	require.Error(t, manager.completeReusedCreate(pending))
+	_, err = manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_ENABLED, 2)
+	require.NoError(t, err)
+	_, err = manager.UpdateKeyspaceStateByID(42, keyspacepb.KeyspaceState_DISABLED, 3)
+	require.NoError(t, err)
+	require.Empty(t, manager.reuse.pending)
 }
 
 func TestArchiveRejectsLateAppliedSplit(t *testing.T) {
