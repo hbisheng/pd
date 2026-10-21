@@ -66,7 +66,7 @@ func saveReuseTestMeta(t *testing.T, manager *Manager, id uint32, state keyspace
 func prepareIsolatedReuse(t *testing.T, manager *Manager, cluster *mockcluster.Cluster) {
 	for id := uint32(41); id <= 43; id++ {
 		state := keyspacepb.KeyspaceState_ENABLED
-		if id == 42 {
+		if id >= 42 {
 			state = keyspacepb.KeyspaceState_TOMBSTONE
 		}
 		saveReuseTestMeta(t, manager, id, state)
@@ -105,7 +105,18 @@ func TestReclaimWaitsForDeletedNeighborAndMultipleRegions(t *testing.T) {
 	cluster.PutRegion(covering)
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
 	_, err = manager.LoadKeyspaceByID(42)
+	require.NoError(t, err) // A merge with only the left neighbor is insufficient.
+	cluster.PutRegion(covering.Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
+	require.NoError(t, manager.RequestKeyspaceReclaim(42))
+	_, err = manager.LoadKeyspaceByID(42)
+	require.NoError(t, err) // Cleaner must first release the lower tombstone.
+	require.NoError(t, manager.RequestKeyspaceReclaim(41))
+	require.NoError(t, manager.RequestKeyspaceReclaim(42))
+	_, err = manager.LoadKeyspaceByID(42)
 	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
+	require.NoError(t, manager.RequestKeyspaceReclaim(43))
+	_, err = manager.LoadKeyspaceByID(43)
+	require.NoError(t, err) // The final ID in the merged Region is retained.
 }
 func TestBitmapUpdatesPreserveOtherIDsAndLayout(t *testing.T) {
 	storage, _, manager := newReuseTestManager(t)

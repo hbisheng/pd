@@ -19,9 +19,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/gogo/protobuf/proto"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
@@ -62,6 +65,7 @@ type reuseSplitGrant struct {
 }
 
 type reuseState struct {
+	claimMu      sync.Mutex // Publish each lower claim into pending before another claim can split.
 	mu           sync.RWMutex
 	pending      map[uint32]*keyspacepb.KeyspaceMeta
 	grants       map[uint32]*reuseSplitGrant
@@ -330,6 +334,58 @@ func (manager *Manager) splittableKeyspaceRegion(id uint32) *core.RegionInfo {
 	return region
 }
 
+// firstRegionKeyspace finds the first complete keyspace covered by the Region.
+func firstRegionKeyspace(region *core.RegionInfo) uint32 {
+	return uint32(sort.Search(int(constant.ReservedKeyspaceIDStart), func(id int) bool {
+		return bytes.Compare(MakeRegionBound(uint32(id)).TxnLeftBound, region.GetStartKey()) >= 0
+	}))
+}
+
+// lowerTombstonesReclaimed bounds work even if Cleaner requests IDs out of order.
+// Reclaimed metadata is deleted, so ascending reclamation skips holes cheaply.
+func (manager *Manager) lowerTombstonesReclaimed(txn kv.Txn, region *core.RegionInfo, id uint32) (bool, error) {
+	_, values, err := txn.LoadRange(keypath.KeyspaceMetaPath(firstRegionKeyspace(region)), keypath.KeyspaceMetaPath(id), freeIDScanLimit)
+	if err != nil {
+		return false, err
+	}
+	for _, value := range values {
+		meta := &keyspacepb.KeyspaceMeta{}
+		if err := proto.Unmarshal([]byte(value), meta); err != nil {
+			return false, err
+		}
+		if meta.State == keyspacepb.KeyspaceState_TOMBSTONE {
+			return false, nil
+		}
+	}
+	return len(values) < freeIDScanLimit, nil
+}
+
+// lowerFreeIDsClaimed preserves publication order inside one merged Region even
+// when the allocation cursor starts on a later bitmap page.
+func (manager *Manager) lowerFreeIDsClaimed(txn kv.Txn, region *core.RegionInfo, id uint32) (bool, error) {
+	first := firstRegionKeyspace(region)
+	width := uint32(manager.bitmapBytes() * 8)
+	keys, values, err := txn.LoadRange(bitmapPath(first/width), bitmapPath(id/width)+"\x00", freeIDScanLimit)
+	if err != nil {
+		return false, err
+	}
+	for i, key := range keys {
+		bucket, err := strconv.ParseUint(key[len(bitmapPrefix()):], 10, 32)
+		if err != nil || len(values[i]) != manager.bitmapBytes() {
+			return false, errors.New("invalid free bitmap encoding")
+		}
+		for offset, bits := range []byte(values[i]) {
+			for bit := uint32(0); bit < 8; bit++ {
+				candidate := uint32(bucket)*width + uint32(offset*8) + bit
+				if candidate >= first && candidate < id && bits&(1<<bit) != 0 {
+					return false, nil
+				}
+			}
+		}
+	}
+	return len(keys) < freeIDScanLimit, nil
+}
+
 // RequestKeyspaceReclaim releases an ID without modifying TiKV. Cleaner can
 // retry while waiting for a cross-keyspace merge.
 func (manager *Manager) RequestKeyspaceReclaim(id uint32) error {
@@ -352,14 +408,14 @@ func (manager *Manager) RequestKeyspaceReclaim(id uint32) error {
 	if !manager.transactionalReuseConfig(meta.Config) {
 		return errors.New("ID reuse only supports transactional keyspaces")
 	}
-	region := manager.splittableKeyspaceRegion(id)
-	if region == nil {
+	region := manager.coveringKeyspaceRegion(id)
+	if region == nil || !reusableKeyspaceID(id+1) || !regionCoversKeyspace(region.GetMeta(), MakeRegionBound(id+1)) {
 		return nil
 	}
 	if err := manager.reuseAdmissionReady(region); err != nil {
 		return err
 	}
-	return manager.releaseReclaimedID(meta)
+	return manager.releaseReclaimedID(meta, region)
 }
 func (manager *Manager) tryCompleteReusedCreate(expected *keyspacepb.KeyspaceMeta) error {
 	if !manager.config.IsIDReuseEnabled() {
@@ -533,11 +589,38 @@ func (manager *Manager) changeFreeBit(txn kv.Txn, id uint32, free bool) error {
 	}
 	return txn.Save(path, string(bits))
 }
-func (manager *Manager) releaseReclaimedID(expected *keyspacepb.KeyspaceMeta) error {
+func (manager *Manager) releaseReclaimedID(expected *keyspacepb.KeyspaceMeta, region *core.RegionInfo) error {
+	released := false
 	var revision uint64
 	manager.metaLock.Lock(expected.GetId())
 	defer manager.metaLock.Unlock(expected.GetId())
 	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		// Read before range scans: the revision CAS also detects newly inserted
+		// bitmap buckets, which LoadRange alone cannot fence.
+		if _, err := loadNameRevision(txn); err != nil {
+			return err
+		}
+		next, err := manager.store.LoadKeyspaceMeta(txn, expected.GetId()+1)
+		if err != nil {
+			return err
+		}
+		if next == nil {
+			id := expected.GetId() + 1
+			bits, err := txn.Load(bitmapPath(id / uint32(manager.bitmapBytes()*8)))
+			if err != nil {
+				return err
+			}
+			if len(bits) != manager.bitmapBytes() || bits[(id%uint32(manager.bitmapBytes()*8))/8]&(1<<(id%8)) == 0 {
+				return nil
+			}
+		} else if next.State != keyspacepb.KeyspaceState_TOMBSTONE {
+			return nil
+		}
+		ready, err := manager.lowerTombstonesReclaimed(txn, region, expected.GetId())
+		if err != nil || !ready {
+			return err
+		}
+
 		meta, err := manager.store.LoadKeyspaceMeta(txn, expected.GetId())
 		if err != nil {
 			return err
@@ -554,10 +637,11 @@ func (manager *Manager) releaseReclaimedID(expected *keyspacepb.KeyspaceMeta) er
 		if err := manager.changeFreeBit(txn, meta.GetId(), true); err != nil {
 			return err
 		}
+		released = true
 		revision, err = advanceNameRevision(txn)
 		return err
 	})
-	if err == nil {
+	if err == nil && released {
 		manager.publishNameRevision(revision, expected.GetId())
 		manager.reuse.mu.Lock()
 		delete(manager.reuse.pending, expected.GetId())
@@ -590,120 +674,158 @@ func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]s
 	if err := manager.ensureBitmapLayout(); err != nil {
 		return nil, err
 	}
+	manager.reuse.claimMu.Lock()
+	defer manager.reuse.claimMu.Unlock()
+
 	manager.reuse.mu.RLock()
 	scanStart := manager.reuse.scanStart
 	manager.reuse.mu.RUnlock()
 	if scanStart == "" {
 		scanStart = bitmapPrefix()
 	}
-	var nextScanStart string
+	var keys, values []string
+	// The page only discovers candidates. Each claim revalidates its free bit
+	// and ordering separately, keeping etcd comparisons bounded per transaction.
+	err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		var err error
+		keys, values, err = txn.LoadRange(scanStart, clientv3.GetPrefixRangeEnd(bitmapPrefix()), freeIDScanLimit)
+		if err == nil && len(keys) == 0 && scanStart != bitmapPrefix() {
+			keys, values, err = txn.LoadRange(bitmapPrefix(), clientv3.GetPrefixRangeEnd(bitmapPrefix()), freeIDScanLimit)
+		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Rotate even if this page has no eligible candidate, so unrelated Regions
+	// are not starved by blocked IDs at the beginning of the bitmap.
+	nextScanStart := bitmapPrefix()
+	if len(keys) == freeIDScanLimit {
+		nextScanStart = keys[len(keys)-1] + "\x00"
+	}
+	manager.reuse.mu.Lock()
+	manager.reuse.scanStart = nextScanStart
+	manager.reuse.mu.Unlock()
+	for index, key := range keys {
+		bucket, err := strconv.ParseUint(key[len(bitmapPrefix()):], 10, 32)
+		if err != nil || len(values[index]) != manager.bitmapBytes() {
+			return nil, errors.New("invalid free bitmap encoding")
+		}
+		for offset, bits := range []byte(values[index]) {
+			for bit := uint32(0); bit < 8; bit++ {
+				if bits&(1<<bit) == 0 {
+					continue
+				}
+				id := uint32(bucket)*uint32(manager.bitmapBytes()*8) + uint32(offset*8) + bit
+				if !reusableKeyspaceID(id) {
+					return nil, errors.New("protected ID in free bitmap")
+				}
+				meta, revision, err := manager.claimReusedKeyspace(id, name, config, createTime)
+				if err != nil {
+					return nil, err
+				}
+				if meta == nil {
+					continue
+				}
+				manager.publishNameRevision(revision, meta.GetId())
+				manager.cacheReuseMeta(meta)
+				manager.keyspaceNameLookup.Store(meta.GetId(), name)
+				if err := manager.ensureReuseRegionRule(meta); err != nil {
+					if cancelErr := manager.cancelReusedCreate(meta); cancelErr != nil {
+						return nil, cancelErr
+					}
+					return nil, err
+				}
+				return meta, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+// claimReusedKeyspace atomically publishes one candidate after all lower IDs in
+// its current Region have been reclaimed and claimed. Split completion is not
+// required; the caller serializes publication through pending-cache installation.
+func (manager *Manager) claimReusedKeyspace(id uint32, name string, config map[string]string, createTime int64) (*keyspacepb.KeyspaceMeta, uint64, error) {
 	for attempt := 0; attempt < 16; attempt++ {
 		var meta *keyspacepb.KeyspaceMeta
 		var revision uint64
-		err = manager.runTxnWithMetaGroupLock(func(txn kv.Txn) error {
-			keys, values, err := txn.LoadRange(scanStart, clientv3.GetPrefixRangeEnd(bitmapPrefix()), freeIDScanLimit)
+		err := manager.runTxnWithMetaGroupLock(func(txn kv.Txn) error {
+			// Fence newly inserted bitmap buckets before any range scan.
+			if _, err := loadNameRevision(txn); err != nil {
+				return err
+			}
+			region := manager.coveringKeyspaceRegion(id)
+			if region == nil || !reusableKeyspaceID(id+1) || !regionCoversKeyspace(region.GetMeta(), MakeRegionBound(id+1)) || manager.reuseAdmissionReady(region) != nil {
+				return nil
+			}
+			width := uint32(manager.bitmapBytes() * 8)
+			bits, err := txn.Load(bitmapPath(id / width))
 			if err != nil {
 				return err
 			}
-			if len(keys) == 0 && scanStart != bitmapPrefix() {
-				keys, values, err = txn.LoadRange(bitmapPrefix(), clientv3.GetPrefixRangeEnd(bitmapPrefix()), freeIDScanLimit)
-				if err != nil {
-					return err
-				}
+			if bits == "" {
+				return nil
 			}
-			// Rotate bounded pages across requests, including pages with no eligible IDs.
-			nextScanStart = bitmapPrefix()
-			if len(keys) == freeIDScanLimit {
-				nextScanStart = keys[len(keys)-1] + "\x00"
+			if len(bits) != manager.bitmapBytes() {
+				return errors.New("invalid free bitmap encoding")
 			}
-			for index, key := range keys {
-				bucket, err := strconv.ParseUint(key[len(bitmapPrefix()):], 10, 32)
-				if err != nil || len(values[index]) != manager.bitmapBytes() {
-					return errors.New("invalid free bitmap encoding")
+			if bits[(id%width)/8]&(1<<(id%8)) == 0 {
+				return nil
+			}
+			ready, err := manager.lowerTombstonesReclaimed(txn, region, id)
+			if err != nil || !ready {
+				return err
+			}
+			ready, err = manager.lowerFreeIDsClaimed(txn, region, id)
+			if err != nil || !ready {
+				return err
+			}
+			exists, _, err := manager.store.LoadKeyspaceID(txn, name)
+			if err != nil {
+				return err
+			}
+			if exists {
+				return errs.ErrKeyspaceExists
+			}
+			old, err := manager.store.LoadKeyspaceMeta(txn, id)
+			if err != nil {
+				return err
+			}
+			if old != nil {
+				return errs.ErrEtcdTxnConflict
+			}
+			meta = &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: name, Config: cloneKeyspaceConfig(config), State: keyspacepb.KeyspaceState_DISABLED, PendingInitialization: true, CreatedAt: createTime, StateChangedAt: createTime}
+			if err := manager.changeFreeBit(txn, id, false); err != nil {
+				return err
+			}
+			if err := manager.store.SaveKeyspaceID(txn, id, name); err != nil {
+				return err
+			}
+			if manager.mgm != nil && manager.mgm.hasGroupsLocked() {
+				groupID, groupErr := manager.mgm.findMinMetaGroup(txn)
+				if groupErr != nil && !errors.ErrorEqual(groupErr, errNoAvailableMetaServiceGroups) {
+					return groupErr
 				}
-				for offset, bits := range []byte(values[index]) {
-					for bit := uint32(0); bit < 8; bit++ {
-						if bits&(1<<bit) == 0 {
-							continue
-						}
-						id := uint32(bucket)*uint32(manager.bitmapBytes()*8) + uint32(offset*8) + bit
-						if !reusableKeyspaceID(id) {
-							return errors.New("protected ID in free bitmap")
-						}
-						region := manager.splittableKeyspaceRegion(id)
-						if region == nil || manager.reuseAdmissionReady(region) != nil {
-							continue
-						}
-						exists, _, err := manager.store.LoadKeyspaceID(txn, name)
-						if err != nil {
-							return err
-						}
-						if exists {
-							return errs.ErrKeyspaceExists
-						}
-						old, err := manager.store.LoadKeyspaceMeta(txn, id)
-						if err != nil {
-							return err
-						}
-						if old != nil {
-							return errs.ErrEtcdTxnConflict
-						}
-						meta = &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: name, Config: cloneKeyspaceConfig(config), State: keyspacepb.KeyspaceState_DISABLED, PendingInitialization: true, CreatedAt: createTime, StateChangedAt: createTime}
-						if err := manager.changeFreeBit(txn, id, false); err != nil {
-							return err
-						}
-						if err := manager.store.SaveKeyspaceID(txn, id, name); err != nil {
-							return err
-						}
-						if manager.mgm != nil && manager.mgm.hasGroupsLocked() {
-							groupID, groupErr := manager.mgm.findMinMetaGroup(txn)
-							if groupErr != nil && !errors.ErrorEqual(groupErr, errNoAvailableMetaServiceGroups) {
-								return groupErr
-							}
-							if groupErr == nil {
-								meta.Config[MetaServiceGroupIDKey] = groupID
-								if err := manager.mgm.updateAssignmentTxn(txn, "", groupID); err != nil {
-									return err
-								}
-							}
-						}
-						if err := manager.store.SaveKeyspaceMeta(txn, meta); err != nil {
-							return err
-						}
-						revision, err = advanceNameRevision(txn)
+				if groupErr == nil {
+					meta.Config[MetaServiceGroupIDKey] = groupID
+					if err := manager.mgm.updateAssignmentTxn(txn, "", groupID); err != nil {
 						return err
 					}
 				}
 			}
-			return nil
+			if err := manager.store.SaveKeyspaceMeta(txn, meta); err != nil {
+				return err
+			}
+			revision, err = advanceNameRevision(txn)
+			return err
 		})
-		if err != nil {
-			if errors.ErrorEqual(err, errs.ErrKeyspaceExists) {
-				return nil, err
-			}
-			if errors.ErrorEqual(err, errs.ErrEtcdTxnConflict) {
-				continue
-			}
-			return nil, err
+		if errors.ErrorEqual(err, errs.ErrEtcdTxnConflict) {
+			continue
 		}
-		manager.reuse.mu.Lock()
-		manager.reuse.scanStart = nextScanStart
-		manager.reuse.mu.Unlock()
-		if meta == nil {
-			return nil, nil
-		}
-		manager.publishNameRevision(revision, meta.GetId())
-		manager.cacheReuseMeta(meta)
-		manager.keyspaceNameLookup.Store(meta.GetId(), name)
-		if err := manager.ensureReuseRegionRule(meta); err != nil {
-			if cancelErr := manager.cancelReusedCreate(meta); cancelErr != nil {
-				return nil, cancelErr
-			}
-			return nil, err
-		}
-		return meta, nil
+		return meta, revision, err
 	}
-	return nil, errors.New("free bitmap remained contended")
+	return nil, 0, errors.New("free bitmap remained contended")
 }
 func (manager *Manager) waitReusedCreate(meta *keyspacepb.KeyspaceMeta) (result *keyspacepb.KeyspaceMeta, err error) {
 	defer func() {
