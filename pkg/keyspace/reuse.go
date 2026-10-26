@@ -43,15 +43,9 @@ import (
 )
 
 const (
-	freeIDScanLimit        = 32
-	reuseProtocolVersion   = 6
-	nameChangeHistoryLimit = 1024
+	freeIDScanLimit      = 32
+	reuseProtocolVersion = 6
 )
-
-type nameChange struct {
-	revision uint64
-	id       uint32
-}
 
 // A split grant uses IDs already allocated by AskBatchSplit. TiKV reads the
 // keyspace configuration after receiving this grant, then reports applied children
@@ -64,16 +58,14 @@ type reuseSplitGrant struct {
 }
 
 type reuseState struct {
-	claimMu      sync.Mutex // Publish each lower claim into pending before another claim can split.
-	mu           sync.RWMutex
-	pending      map[uint32]*keyspacepb.KeyspaceMeta
-	grants       map[uint32]*reuseSplitGrant
-	capable      map[uint64]bool
-	watermark    uint64
-	scanStart    string
-	nameRevision uint64
-	nameChanges  []nameChange
-	now          func() time.Time
+	claimMu   sync.Mutex // Publish each lower claim into pending before another claim can split.
+	mu        sync.RWMutex
+	pending   map[uint32]*keyspacepb.KeyspaceMeta
+	grants    map[uint32]*reuseSplitGrant
+	capable   map[uint64]bool
+	watermark uint64
+	scanStart string
+	now       func() time.Time
 }
 
 func newReuseState() *reuseState {
@@ -138,18 +130,14 @@ func (manager *Manager) cacheReuseMeta(meta *keyspacepb.KeyspaceMeta) {
 	manager.keyspaceStateLookup.Store(meta.GetId(), meta.State)
 }
 
-// StartIDReuse reloads allocator/cache revisions. Interrupted Creates remain
+// StartIDReuse reloads the allocator watermark. Interrupted Creates remain
 // DISABLED for the control plane to handle through the ordinary lifecycle.
 func (manager *Manager) StartIDReuse() error {
 	// The allocator's in-memory window starts at zero after restart. Read its
 	// existing durable counter once, rather than requiring a new allocation.
-	var watermark, nameRevision uint64
+	var watermark uint64
 	if err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		var err error
-		nameRevision, err = loadNameRevision(txn)
-		if err != nil {
-			return err
-		}
 		value, err := txn.Load(keypath.KeyspaceAllocIDPath())
 		if err != nil || value == "" {
 			return err
@@ -160,8 +148,6 @@ func (manager *Manager) StartIDReuse() error {
 		return err
 	}
 	manager.reuse.mu.Lock()
-	manager.reuse.nameRevision = nameRevision
-	manager.reuse.nameChanges = nil
 	manager.reuse.watermark = watermark
 	manager.reuse.scanStart = bitmapPrefix()
 	manager.reuse.pending = make(map[uint32]*keyspacepb.KeyspaceMeta)
@@ -267,7 +253,7 @@ func (manager *Manager) reuseAdmissionReady(region *core.RegionInfo) error {
 	if max(currentWindow, manager.reuse.watermark) < manager.config.GetIDReuseThreshold() {
 		return errors.New("allocator watermark is below reuse threshold")
 	}
-	// Name-cache invalidation is cluster-wide, including stores with no target replica.
+	// Reuse requires compatible split behavior across the cluster.
 	for _, store := range manager.cluster.GetBasicCluster().GetStores() {
 		if store.IsTiKV() && !store.IsRemoved() && !manager.reuse.capable[store.GetID()] {
 			return errors.Errorf("store %d has not reported reuse protocol v6", store.GetID())
@@ -604,13 +590,12 @@ func (manager *Manager) changeFreeBit(txn kv.Txn, id uint32, free bool) error {
 }
 func (manager *Manager) releaseReclaimedID(expected *keyspacepb.KeyspaceMeta, region *core.RegionInfo) error {
 	released := false
-	var revision uint64
 	manager.metaLock.Lock(expected.GetId())
 	defer manager.metaLock.Unlock(expected.GetId())
 	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		// Read before range scans: the revision CAS also detects newly inserted
 		// bitmap buckets, which LoadRange alone cannot fence.
-		if _, err := loadNameRevision(txn); err != nil {
+		if _, err := loadFreeIDRevision(txn); err != nil {
 			return err
 		}
 		next, err := manager.store.LoadKeyspaceMeta(txn, expected.GetId()+1)
@@ -651,11 +636,9 @@ func (manager *Manager) releaseReclaimedID(expected *keyspacepb.KeyspaceMeta, re
 			return err
 		}
 		released = true
-		revision, err = advanceNameRevision(txn)
-		return err
+		return advanceFreeIDRevision(txn)
 	})
 	if err == nil && released {
-		manager.publishNameRevision(revision, expected.GetId())
 		manager.reuse.mu.Lock()
 		delete(manager.reuse.pending, expected.GetId())
 		delete(manager.reuse.grants, expected.GetId())
@@ -733,14 +716,13 @@ func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]s
 				if !reusableKeyspaceID(id) {
 					return nil, errors.New("protected ID in free bitmap")
 				}
-				meta, revision, err := manager.claimReusedKeyspace(id, name, config, createTime)
+				meta, err := manager.claimReusedKeyspace(id, name, config, createTime)
 				if err != nil {
 					return nil, err
 				}
 				if meta == nil {
 					continue
 				}
-				manager.publishNameRevision(revision, meta.GetId())
 				manager.reuse.mu.Lock()
 				pending := *meta
 				pending.Config = cloneKeyspaceConfig(meta.Config)
@@ -764,13 +746,12 @@ func (manager *Manager) tryCreateReusedKeyspace(name string, config map[string]s
 // claimReusedKeyspace atomically publishes one candidate after all lower IDs in
 // its current Region have been reclaimed and claimed. Split completion is not
 // required; the caller serializes publication through pending-cache installation.
-func (manager *Manager) claimReusedKeyspace(id uint32, name string, config map[string]string, createTime int64) (*keyspacepb.KeyspaceMeta, uint64, error) {
+func (manager *Manager) claimReusedKeyspace(id uint32, name string, config map[string]string, createTime int64) (*keyspacepb.KeyspaceMeta, error) {
 	for attempt := 0; attempt < 16; attempt++ {
 		var meta *keyspacepb.KeyspaceMeta
-		var revision uint64
 		err := manager.runTxnWithMetaGroupLock(func(txn kv.Txn) error {
 			// Fence newly inserted bitmap buckets before any range scan.
-			if _, err := loadNameRevision(txn); err != nil {
+			if _, err := loadFreeIDRevision(txn); err != nil {
 				return err
 			}
 			region := manager.coveringKeyspaceRegion(id)
@@ -837,15 +818,14 @@ func (manager *Manager) claimReusedKeyspace(id uint32, name string, config map[s
 			if err := manager.store.SaveKeyspaceMeta(txn, meta); err != nil {
 				return err
 			}
-			revision, err = advanceNameRevision(txn)
-			return err
+			return advanceFreeIDRevision(txn)
 		})
 		if errors.ErrorEqual(err, errs.ErrEtcdTxnConflict) {
 			continue
 		}
-		return meta, revision, err
+		return meta, err
 	}
-	return nil, 0, errors.New("free bitmap remained contended")
+	return nil, errors.New("free bitmap remained contended")
 }
 func (manager *Manager) waitReusedCreate(meta *keyspacepb.KeyspaceMeta) (result *keyspacepb.KeyspaceMeta, err error) {
 	defer func() {
@@ -886,75 +866,25 @@ func (manager *Manager) waitReusedCreate(meta *keyspacepb.KeyspaceMeta) (result 
 	}
 }
 
-// A single durable revision fences ID-to-name caches on every Store. It changes
-// in the same CAS transaction as ownership/free bits, and survives PD restart.
-func nameRevisionPath() string {
-	return fmt.Sprintf("/pd/%d/keyspaces/name_revision", keypath.ClusterID())
+// A shared revision fences range scans against concurrently inserted free-ID
+// buckets. Existing keys are already protected by the transaction's comparisons.
+func freeIDRevisionPath() string {
+	return fmt.Sprintf("/pd/%d/keyspaces/free/revision", keypath.ClusterID())
 }
-func loadNameRevision(txn kv.Txn) (uint64, error) {
-	value, err := txn.Load(nameRevisionPath())
+func loadFreeIDRevision(txn kv.Txn) (uint64, error) {
+	value, err := txn.Load(freeIDRevisionPath())
 	if err != nil || value == "" {
 		return 0, err
 	}
 	return strconv.ParseUint(value, 10, 64)
 }
-func advanceNameRevision(txn kv.Txn) (uint64, error) {
-	revision, err := loadNameRevision(txn)
+func advanceFreeIDRevision(txn kv.Txn) error {
+	revision, err := loadFreeIDRevision(txn)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	if revision == ^uint64(0) {
-		return 0, errors.New("keyspace name revision exhausted")
+		return errors.New("free ID revision exhausted")
 	}
-	revision++
-	return revision, txn.Save(nameRevisionPath(), strconv.FormatUint(revision, 10))
-}
-func (manager *Manager) publishNameRevision(revision uint64, id uint32) {
-	manager.reuse.mu.Lock()
-	defer manager.reuse.mu.Unlock()
-	if revision <= manager.reuse.nameRevision {
-		return
-	}
-	// Concurrent transactions may publish out of order. A gap requires a full
-	// invalidation; never pretend the bounded history covers missing changes.
-	if revision != manager.reuse.nameRevision+1 {
-		manager.reuse.nameChanges = nil
-	}
-	manager.reuse.nameRevision = revision
-	manager.reuse.nameChanges = append(manager.reuse.nameChanges, nameChange{revision, id})
-	if len(manager.reuse.nameChanges) > nameChangeHistoryLimit {
-		manager.reuse.nameChanges = manager.reuse.nameChanges[len(manager.reuse.nameChanges)-nameChangeHistoryLimit:]
-	}
-}
-
-// KeyspaceNameRevision is broadcast in every Store heartbeat response so even
-// Stores without replicas of the reused keyspace discard stale metric names.
-func (manager *Manager) KeyspaceNameRevision() uint64 {
-	manager.reuse.mu.RLock()
-	defer manager.reuse.mu.RUnlock()
-	return manager.reuse.nameRevision
-}
-
-// KeyspaceNameUpdates provides loss-tolerant, cluster-wide cache invalidation.
-// A missed bounded history or leadership restart falls back to a full clear.
-func (manager *Manager) KeyspaceNameUpdates(since uint64) (uint64, []uint32, bool) {
-	manager.reuse.mu.RLock()
-	defer manager.reuse.mu.RUnlock()
-	revision := manager.reuse.nameRevision
-	if since >= revision {
-		return revision, nil, false
-	}
-	history := manager.reuse.nameChanges
-	if len(history) == 0 || since < history[0].revision-1 {
-		return revision, nil, true
-	}
-	ids := make([]uint32, 0, len(history))
-	seen := make(map[uint32]bool)
-	for _, change := range history {
-		if change.revision > since && !seen[change.id] {
-			seen[change.id] = true
-			ids = append(ids, change.id)
-		}
-	}
-	return revision, ids, false
+	return txn.Save(freeIDRevisionPath(), strconv.FormatUint(revision+1, 10))
 }

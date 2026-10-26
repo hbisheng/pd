@@ -209,8 +209,7 @@ func TestClaimRevisionRejectsNewLowerBitmapBucket(t *testing.T) {
 			if err := manager.changeFreeBit(txn, 42, true); err != nil {
 				return err
 			}
-			_, err := advanceNameRevision(txn)
-			return err
+			return advanceFreeIDRevision(txn)
 		}))
 	}
 	created, err := manager.tryCreateReusedKeyspace("higher", nil, 1)
@@ -295,7 +294,7 @@ func TestClaimRejectsConcurrentCreationInMetadataHole(t *testing.T) {
 			return
 		}
 		injected = true
-		// Ordinary creation fills the hole without changing name_revision. The
+		// Ordinary creation fills the hole without changing free-ID revision. The
 		// claim must conflict on its absent-neighbor read, then defer on retry.
 		require.NoError(t, backend.Base.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 			return manager.store.SaveKeyspaceMeta(txn, &keyspacepb.KeyspaceMeta{
@@ -307,7 +306,11 @@ func TestClaimRejectsConcurrentCreationInMetadataHole(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, injected)
 	require.Nil(t, created)
-	require.Zero(t, manager.KeyspaceNameRevision())
+	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		revision, err := loadFreeIDRevision(txn)
+		require.Zero(t, revision)
+		return err
+	}))
 	_, err = manager.LoadKeyspaceByID(80)
 	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
 }

@@ -82,27 +82,26 @@ func TestReuseStartupDoesNotScanMetadata(t *testing.T) {
 	}
 }
 
-func TestNameRevisionIsAtomicAndRecovered(t *testing.T) {
+func TestFreeIDRevisionChangesWithReclaimAndClaim(t *testing.T) {
 	storage, cluster, manager := newReuseTestManager(t)
 	prepareIsolatedReuse(t, manager, cluster)
 	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
-	require.Equal(t, uint64(1), manager.KeyspaceNameRevision())
+	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		revision, err := loadFreeIDRevision(txn)
+		require.Equal(t, uint64(1), revision)
+		return err
+	}))
 	_, err := manager.tryCreateReusedKeyspace("new-name", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
 	require.NoError(t, err)
-	require.Equal(t, uint64(2), manager.KeyspaceNameRevision())
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		revision, err := loadNameRevision(txn)
+		revision, err := loadFreeIDRevision(txn)
 		require.Equal(t, uint64(2), revision)
 		return err
 	}))
-	require.NoError(t, manager.StartIDReuse())
-	require.Equal(t, uint64(2), manager.KeyspaceNameRevision())
-	manager.publishNameRevision(1, 42)
-	require.Equal(t, uint64(2), manager.KeyspaceNameRevision())
 }
 
-func TestReuseRequiresCacheProtocolOnAllStores(t *testing.T) {
+func TestReuseRequiresCompatibleStores(t *testing.T) {
 	_, cluster, manager := newReuseTestManager(t)
 	cluster.AddRegionStore(2, 0)
 	cluster.AddLabelsStore(3, 0, map[string]string{"engine": "tiflash"})
@@ -111,42 +110,6 @@ func TestReuseRequiresCacheProtocolOnAllStores(t *testing.T) {
 	require.Error(t, manager.reuseAdmissionReady(newReuseTestRegion(42, 42)))
 	manager.RecordIDReuseCapability(2, reuseProtocolVersion)
 	require.NoError(t, manager.reuseAdmissionReady(newReuseTestRegion(42, 42)))
-}
-
-func TestNameBroadcastIsBoundedAndSurvivesMissedHistory(t *testing.T) {
-	_, _, manager := newReuseTestManager(t)
-	manager.publishNameRevision(1, 42)
-	manager.publishNameRevision(2, 43)
-	revision, ids, all := manager.KeyspaceNameUpdates(0)
-	require.Equal(t, uint64(2), revision)
-	require.ElementsMatch(t, []uint32{42, 43}, ids)
-	require.False(t, all)
-	_, ids, all = manager.KeyspaceNameUpdates(1)
-	require.Equal(t, []uint32{43}, ids)
-	require.False(t, all)
-	_, ids, all = manager.KeyspaceNameUpdates(2)
-	require.Empty(t, ids)
-	require.False(t, all)
-	// An out-of-order publish must not conceal a missing notification.
-	manager.publishNameRevision(4, 44)
-	_, ids, all = manager.KeyspaceNameUpdates(2)
-	require.Empty(t, ids)
-	require.True(t, all)
-	manager.publishNameRevision(3, 45)
-	_, _, all = manager.KeyspaceNameUpdates(2)
-	require.True(t, all)
-	for revision := uint64(5); revision <= nameChangeHistoryLimit+5; revision++ {
-		manager.publishNameRevision(revision, 42)
-	}
-	require.Len(t, manager.reuse.nameChanges, nameChangeHistoryLimit)
-	_, _, all = manager.KeyspaceNameUpdates(0)
-	require.True(t, all)
-	// Startup reloads the durable revision, but intentionally no change log.
-	manager.reuse.mu.Lock()
-	manager.reuse.nameChanges = nil
-	manager.reuse.mu.Unlock()
-	_, _, all = manager.KeyspaceNameUpdates(4)
-	require.True(t, all)
 }
 
 func TestSplitBeforeClaimIsCanceledWithoutInitialization(t *testing.T) {
