@@ -55,7 +55,6 @@ func newReuseTestManagerWithKV(t *testing.T, backend kv.Base) (*endpoint.Storage
 	require.NoError(t, kgm.Bootstrap(ctx))
 	manager := NewKeyspaceManager(ctx, storage, cluster, allocator, &mockConfig{EnableIDReuse: true, IDReuseThreshold: 10, WaitRegionSplitTimeout: typeutil.NewDuration(100 * time.Millisecond), CheckRegionSplitInterval: typeutil.NewDuration(time.Millisecond)}, kgm, nil)
 	manager.reuse.now = func() time.Time { return time.Unix(4_000_000, 0) }
-	manager.RecordIDReuseCapability(1, reuseProtocolVersion)
 	require.NoError(t, manager.ensureBitmapLayout())
 	return storage, cluster, manager
 }
@@ -178,13 +177,12 @@ func TestReuseWatermarkSurvivesRestartWithoutNewAllocation(t *testing.T) {
 	region := newReuseTestRegion(42, 42)
 	cluster.PutRegion(region)
 	require.NoError(t, manager.idAllocator.SetBase(0))
-	require.Error(t, manager.reuseAdmissionReady(region))
+	require.Error(t, manager.reuseAdmissionReady())
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		return txn.Save(keypath.KeyspaceAllocIDPath(), string(typeutil.Uint64ToBytes(1000)))
 	}))
 	require.NoError(t, manager.StartIDReuse())
-	manager.RecordIDReuseCapability(1, reuseProtocolVersion)
-	require.NoError(t, manager.reuseAdmissionReady(region))
+	require.NoError(t, manager.reuseAdmissionReady())
 }
 
 func TestCMEKRequestLeavesFreeIDsForStarterReuse(t *testing.T) {

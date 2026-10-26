@@ -101,17 +101,6 @@ func TestFreeIDRevisionChangesWithReclaimAndClaim(t *testing.T) {
 	}))
 }
 
-func TestReuseRequiresCompatibleStores(t *testing.T) {
-	_, cluster, manager := newReuseTestManager(t)
-	cluster.AddRegionStore(2, 0)
-	cluster.AddLabelsStore(3, 0, map[string]string{"engine": "tiflash"})
-	require.Error(t, manager.reuseAdmissionReady(newReuseTestRegion(42, 42)))
-	manager.RecordIDReuseCapability(2, reuseProtocolVersion-1)
-	require.Error(t, manager.reuseAdmissionReady(newReuseTestRegion(42, 42)))
-	manager.RecordIDReuseCapability(2, reuseProtocolVersion)
-	require.NoError(t, manager.reuseAdmissionReady(newReuseTestRegion(42, 42)))
-}
-
 func TestSplitBeforeClaimIsCanceledWithoutInitialization(t *testing.T) {
 	backend := &reuseHookKV{Base: kv.NewMemoryKV()}
 	storage, cluster, manager := newReuseTestManagerWithKV(t, backend)

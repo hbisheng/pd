@@ -42,10 +42,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-const (
-	freeIDScanLimit      = 32
-	reuseProtocolVersion = 6
-)
+const freeIDScanLimit = 32
 
 // A split grant uses IDs already allocated by AskBatchSplit. TiKV reads the
 // keyspace configuration after receiving this grant, then reports applied children
@@ -62,14 +59,13 @@ type reuseState struct {
 	mu        sync.RWMutex
 	pending   map[uint32]*keyspacepb.KeyspaceMeta
 	grants    map[uint32]*reuseSplitGrant
-	capable   map[uint64]bool
 	watermark uint64
 	scanStart string
 	now       func() time.Time
 }
 
 func newReuseState() *reuseState {
-	return &reuseState{pending: make(map[uint32]*keyspacepb.KeyspaceMeta), grants: make(map[uint32]*reuseSplitGrant), capable: make(map[uint64]bool), now: time.Now}
+	return &reuseState{pending: make(map[uint32]*keyspacepb.KeyspaceMeta), grants: make(map[uint32]*reuseSplitGrant), now: time.Now}
 }
 
 func cloneKeyspaceConfig(config map[string]string) map[string]string {
@@ -152,7 +148,6 @@ func (manager *Manager) StartIDReuse() error {
 	manager.reuse.scanStart = bitmapPrefix()
 	manager.reuse.pending = make(map[uint32]*keyspacepb.KeyspaceMeta)
 	manager.reuse.grants = make(map[uint32]*reuseSplitGrant)
-	manager.reuse.capable = make(map[uint64]bool)
 	manager.reuse.mu.Unlock()
 	if !manager.config.IsIDReuseEnabled() {
 		return nil
@@ -160,16 +155,9 @@ func (manager *Manager) StartIDReuse() error {
 	return manager.ensureBitmapLayout()
 }
 
-// RecordIDReuseCapability rejects stores speaking the earlier POC protocol.
-func (manager *Manager) RecordIDReuseCapability(storeID uint64, version uint32) {
-	manager.reuse.mu.Lock()
-	manager.reuse.capable[storeID] = version >= reuseProtocolVersion
-	manager.reuse.mu.Unlock()
-}
-
 // RecordReuseSplitGrant records only grants issued while this creation is pending.
-// TiKV protocol v6 reads keyspace metadata after AskBatchSplit returns; older
-// grants therefore cannot initialize a newly claimed ID.
+// TiKV reads keyspace metadata after AskBatchSplit returns; older grants
+// therefore cannot initialize a newly claimed ID.
 func (manager *Manager) RecordReuseSplitGrant(source *metapb.Region, splits []*pdpb.SplitID) {
 	if source == nil || len(splits) == 0 {
 		return
@@ -236,7 +224,7 @@ func (manager *Manager) rejectIndependentScheduling() error {
 	}
 	return nil
 }
-func (manager *Manager) reuseAdmissionReady(region *core.RegionInfo) error {
+func (manager *Manager) reuseAdmissionReady() error {
 	if !manager.config.IsIDReuseEnabled() {
 		return errors.New("keyspace ID reuse is disabled")
 	}
@@ -252,17 +240,6 @@ func (manager *Manager) reuseAdmissionReady(region *core.RegionInfo) error {
 	defer manager.reuse.mu.RUnlock()
 	if max(currentWindow, manager.reuse.watermark) < manager.config.GetIDReuseThreshold() {
 		return errors.New("allocator watermark is below reuse threshold")
-	}
-	// Reuse requires compatible split behavior across the cluster.
-	for _, store := range manager.cluster.GetBasicCluster().GetStores() {
-		if store.IsTiKV() && !store.IsRemoved() && !manager.reuse.capable[store.GetID()] {
-			return errors.Errorf("store %d has not reported reuse protocol v6", store.GetID())
-		}
-	}
-	for _, peer := range region.GetPeers() {
-		if !manager.reuse.capable[peer.GetStoreId()] {
-			return errors.Errorf("store %d has not reported reuse protocol v6", peer.GetStoreId())
-		}
 	}
 	return nil
 }
@@ -412,7 +389,7 @@ func (manager *Manager) RequestKeyspaceReclaim(id uint32) error {
 	if region == nil || !reusableKeyspaceID(id+1) || !regionCoversKeyspace(region.GetMeta(), MakeRegionBound(id+1)) {
 		return nil
 	}
-	if err := manager.reuseAdmissionReady(region); err != nil {
+	if err := manager.reuseAdmissionReady(); err != nil {
 		return err
 	}
 	return manager.releaseReclaimedID(meta, region)
@@ -425,7 +402,7 @@ func (manager *Manager) tryCompleteReusedCreate(expected *keyspacepb.KeyspaceMet
 	if err != nil {
 		return nil
 	}
-	if err := manager.reuseAdmissionReady(region); err != nil {
+	if err := manager.reuseAdmissionReady(); err != nil {
 		return err
 	}
 	manager.reuse.mu.RLock()
@@ -755,7 +732,7 @@ func (manager *Manager) claimReusedKeyspace(id uint32, name string, config map[s
 				return err
 			}
 			region := manager.coveringKeyspaceRegion(id)
-			if region == nil || !reusableKeyspaceID(id+1) || !regionCoversKeyspace(region.GetMeta(), MakeRegionBound(id+1)) || manager.reuseAdmissionReady(region) != nil {
+			if region == nil || !reusableKeyspaceID(id+1) || !regionCoversKeyspace(region.GetMeta(), MakeRegionBound(id+1)) || manager.reuseAdmissionReady() != nil {
 				return nil
 			}
 			width := uint32(manager.bitmapBytes() * 8)

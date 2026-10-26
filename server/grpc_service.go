@@ -1008,8 +1008,6 @@ func (s *GrpcServer) StoreHeartbeat(ctx context.Context, request *pdpb.StoreHear
 	resp.ReplicationStatus = rc.GetReplicationMode().GetReplicationStatus()
 	resp.ClusterVersion = rc.GetClusterVersion()
 	rc.GetUnsafeRecoveryController().HandleStoreHeartbeat(request, resp)
-	stats := request.GetStats()
-	s.GetKeyspaceManager().RecordIDReuseCapability(stats.GetStoreId(), stats.GetKeyspaceIdReuseProtocolVersion())
 
 	return resp, nil
 }
