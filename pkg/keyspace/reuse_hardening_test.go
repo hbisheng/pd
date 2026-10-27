@@ -27,10 +27,10 @@ import (
 )
 
 func claimSplitReuse(t *testing.T) (*mockcluster.Cluster, *Manager, *keyspacepb.KeyspaceMeta, *metapb.Region) {
-	storage, cluster, manager := newReuseTestManager(t)
+	_, cluster, manager := newReuseTestManager(t)
 	source := newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound))
 	cluster.PutRegion(source)
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
+	seedReuseTestBit(t, manager, 42, true)
 	meta, err := manager.tryCreateReusedKeyspace("split-tenant", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
 	require.NoError(t, err)
 	return cluster, manager, meta, source.GetMeta()

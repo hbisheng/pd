@@ -36,6 +36,14 @@ type reuseHookTxn struct {
 	owner *reuseHookKV
 }
 
+func (t *reuseHookTxn) LoadRangeWithRevision(key, end string, limit int) ([]kv.RevisionedValue, error) {
+	return t.Txn.(kv.RevisionedTxn).LoadRangeWithRevision(key, end, limit)
+}
+func (t *reuseHookTxn) CompareModRevision(key string, revision int64) {
+	t.Txn.(kv.RevisionedTxn).CompareModRevision(key, revision)
+}
+func (t *reuseHookTxn) CommitRevision() int64 { return t.Txn.(kv.RevisionedTxn).CommitRevision() }
+
 func (b *reuseHookKV) RunInTxn(ctx context.Context, f func(kv.Txn) error) error {
 	return b.Base.RunInTxn(ctx, func(txn kv.Txn) error { return f(&reuseHookTxn{txn, b}) })
 }
@@ -56,10 +64,10 @@ func (t *reuseHookTxn) LoadRange(key, end string, limit int) ([]string, []string
 }
 
 func TestFreeBitmapScanReachesLaterEligibleBucket(t *testing.T) {
-	storage, cluster, manager := newReuseTestManager(t)
+	_, cluster, manager := newReuseTestManager(t)
 	for bucket := uint32(0); bucket <= 32; bucket++ {
 		id := bucket*256 + 42
-		require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, id, true) }))
+		seedReuseTestBit(t, manager, id, true)
 	}
 	eligible := uint32(32*256 + 42)
 	cluster.PutRegion(newReuseTestRegion(eligible, uint64(eligible)).Clone(core.WithEndKey(MakeRegionBound(eligible + 1).TxnRightBound)))
@@ -103,9 +111,9 @@ func TestFreeIDRevisionChangesWithReclaimAndClaim(t *testing.T) {
 
 func TestSplitBeforeClaimIsCanceledWithoutInitialization(t *testing.T) {
 	backend := &reuseHookKV{Base: kv.NewMemoryKV()}
-	storage, cluster, manager := newReuseTestManagerWithKV(t, backend)
+	_, cluster, manager := newReuseTestManagerWithKV(t, backend)
 	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
+	seedReuseTestBit(t, manager, 42, true)
 	backend.onSave = func(key string) {
 		if key != keypath.KeyspaceMetaPath(42) {
 			return

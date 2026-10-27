@@ -62,6 +62,35 @@ func saveReuseTestMeta(t *testing.T, manager *Manager, id uint32, state keyspace
 	require.NoError(t, manager.saveNewKeyspace(&keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: state.String() + "-" + string(rune(id+'a')), State: state, Config: map[string]string{}, CreatedAt: 1, StateChangedAt: 2}))
 }
 
+// changeFreeBit seeds authoritative storage in tests, including simulated
+// external writers. Production writers use changeCachedFreeBit under claimMu.
+func (manager *Manager) changeFreeBit(txn kv.Txn, id uint32, free bool) error {
+	path := bitmapPath(id / uint32(manager.bitmapBytes()*8))
+	value, err := txn.Load(path)
+	if err != nil {
+		return err
+	}
+	updated, err := changedFreeBit(value, manager.bitmapBytes(), id, free)
+	if err != nil {
+		return err
+	}
+	if updated == "" {
+		return txn.Remove(path)
+	}
+	return txn.Save(path, updated)
+}
+
+func seedReuseTestBit(t *testing.T, manager *Manager, id uint32, free bool) {
+	t.Helper()
+	manager.reuse.claimMu.Lock()
+	defer manager.reuse.claimMu.Unlock()
+	require.NoError(t, manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, id, free) }))
+	bucket := id / uint32(manager.bitmapBytes()*8)
+	manager.invalidateFreeBucketLocked(bucket)
+	_, err := manager.loadFreeBucketLocked(bucket)
+	require.NoError(t, err)
+}
+
 func prepareIsolatedReuse(t *testing.T, manager *Manager, cluster *mockcluster.Cluster) {
 	for id := uint32(41); id <= 43; id++ {
 		state := keyspacepb.KeyspaceState_ENABLED
@@ -120,9 +149,9 @@ func TestReclaimWaitsForDeletedNeighborAndMultipleRegions(t *testing.T) {
 func TestBitmapUpdatesPreserveOtherIDsAndLayout(t *testing.T) {
 	storage, _, manager := newReuseTestManager(t)
 	for _, id := range []uint32{42, 43, 999} {
-		require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, id, true) }))
+		seedReuseTestBit(t, manager, id, true)
 	}
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, false) }))
+	seedReuseTestBit(t, manager, 42, false)
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		bits, e := txn.Load(bitmapPath(0))
 		require.Zero(t, bits[42/8]&(1<<(42%8)))
@@ -136,10 +165,10 @@ func TestConcurrentClaimsUseDifferentBits(t *testing.T) {
 	// MemoryKV does not enforce transaction read conditions; use real etcd CAS.
 	_, client, clean := etcdutil.NewTestEtcdCluster(t, 1, nil)
 	t.Cleanup(clean)
-	storage, cluster, manager := newReuseTestManagerWithKV(t, kv.NewEtcdKVBase(client))
+	_, cluster, manager := newReuseTestManagerWithKV(t, kv.NewEtcdKVBase(client))
 	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(44).TxnRightBound)))
 	for _, id := range []uint32{42, 43} {
-		require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, id, true) }))
+		seedReuseTestBit(t, manager, id, true)
 	}
 	type result struct {
 		id  uint32
@@ -188,7 +217,7 @@ func TestReuseWatermarkSurvivesRestartWithoutNewAllocation(t *testing.T) {
 func TestCMEKRequestLeavesFreeIDsForStarterReuse(t *testing.T) {
 	storage, cluster, manager := newReuseTestManager(t)
 	cluster.PutRegion(newReuseTestRegion(42, 42))
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, 42, true) }))
+	seedReuseTestBit(t, manager, 42, true)
 	created, err := manager.tryCreateReusedKeyspace("cmek-tenant", map[string]string{"encryption": `{"enabled":true,"vendor":"test","cmek_id":"test-customer-key"}`}, 1)
 	require.NoError(t, err)
 	require.Nil(t, created)

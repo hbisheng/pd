@@ -82,6 +82,9 @@ type Config interface {
 	IsIDReuseEnabled() bool
 	GetIDReuseThreshold() uint64
 	GetIDReuseBucketBytes() int
+	GetIDReuseLoadPageBuckets() int
+	GetIDReuseLoadInterval() time.Duration
+	GetIDReuseReclaimInterval() time.Duration
 	IsEncryptedIDReuseEnabled() bool
 	// GetMetaServiceGroups returns the meta-service groups for keyspace assignment.
 	// key is the meta-service group id and value is the meta-service group addresses.

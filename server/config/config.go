@@ -888,6 +888,12 @@ type KeyspaceConfig struct {
 	EnableEncryptedIDReuse bool `toml:"enable-encrypted-id-reuse" json:"enable-encrypted-id-reuse"`
 	// IDReuseBucketBytes selects the persisted bitmap layout, immutable once installed.
 	IDReuseBucketBytes int `toml:"id-reuse-bucket-bytes" json:"id-reuse-bucket-bytes"`
+	// IDReuseLoadPageBuckets bounds the numeric bucket interval of each cache read.
+	IDReuseLoadPageBuckets int `toml:"id-reuse-load-page-buckets" json:"id-reuse-load-page-buckets"`
+	// IDReuseLoadInterval paces background cache reads, including empty intervals.
+	IDReuseLoadInterval typeutil.Duration `toml:"id-reuse-load-interval" json:"id-reuse-load-interval"`
+	// IDReuseReclaimInterval limits reclamation requests accepted by this leader.
+	IDReuseReclaimInterval typeutil.Duration `toml:"id-reuse-reclaim-interval" json:"id-reuse-reclaim-interval"`
 	// IDReuseThreshold is the minimum reserved allocator-window end at which
 	// new reclamation requests are admitted.
 	IDReuseThreshold uint64 `toml:"id-reuse-threshold" json:"id-reuse-threshold"`
@@ -898,6 +904,12 @@ type KeyspaceConfig struct {
 
 // Validate checks if keyspace config falls within acceptable range.
 func (c *KeyspaceConfig) Validate() error {
+	if n := c.GetIDReuseLoadPageBuckets(); n < 1 || n > 256 {
+		return errors.New("ID reuse load page must cover between 1 and 256 buckets")
+	}
+	if c.GetIDReuseLoadInterval() <= 0 || c.GetIDReuseReclaimInterval() <= 0 {
+		return errors.New("ID reuse load and reclaim intervals must be positive")
+	}
 	if n := c.GetIDReuseBucketBytes(); n < 1 || n > 4096 || n&(n-1) != 0 {
 		return errors.New("bitmap bucket bytes must be a power of two between 1 and 4096")
 	}
@@ -1032,6 +1044,30 @@ func (c *KeyspaceConfig) GetIDReuseBucketBytes() int {
 		return 32
 	}
 	return c.IDReuseBucketBytes
+}
+
+// GetIDReuseLoadPageBuckets returns the maximum buckets in one background read.
+func (c *KeyspaceConfig) GetIDReuseLoadPageBuckets() int {
+	if c.IDReuseLoadPageBuckets == 0 {
+		return 64
+	}
+	return c.IDReuseLoadPageBuckets
+}
+
+// GetIDReuseLoadInterval returns the delay between background cache reads.
+func (c *KeyspaceConfig) GetIDReuseLoadInterval() time.Duration {
+	if c.IDReuseLoadInterval.Duration == 0 {
+		return 100 * time.Millisecond
+	}
+	return c.IDReuseLoadInterval.Duration
+}
+
+// GetIDReuseReclaimInterval returns the minimum spacing between reclaim requests.
+func (c *KeyspaceConfig) GetIDReuseReclaimInterval() time.Duration {
+	if c.IDReuseReclaimInterval.Duration == 0 {
+		return 10 * time.Millisecond
+	}
+	return c.IDReuseReclaimInterval.Duration
 }
 
 // IsEncryptedIDReuseEnabled enables legacy encryption reuse in the POC.

@@ -55,17 +55,34 @@ func TestKeyspaceIDReuseDefaultsAndOverride(t *testing.T) {
 	re.NoError(cfg.Adjust(&meta, false))
 	re.False(cfg.Keyspace.EnableIDReuse)
 	re.Equal(uint64(1_000_000), cfg.Keyspace.IDReuseThreshold)
+	re.Equal(32, cfg.Keyspace.GetIDReuseBucketBytes())
+	re.Equal(64, cfg.Keyspace.GetIDReuseLoadPageBuckets())
+	re.Equal(100*time.Millisecond, cfg.Keyspace.GetIDReuseLoadInterval())
+	re.Equal(10*time.Millisecond, cfg.Keyspace.GetIDReuseReclaimInterval())
 
 	cfg = NewConfig()
 	meta, err = toml.Decode(`
 [keyspace]
 enable-id-reuse = true
 id-reuse-threshold = 42
+id-reuse-load-page-buckets = 8
+id-reuse-load-interval = "200ms"
+id-reuse-reclaim-interval = "20ms"
 `, &cfg)
 	re.NoError(err)
 	re.NoError(cfg.Adjust(&meta, false))
 	re.True(cfg.Keyspace.EnableIDReuse)
 	re.Equal(uint64(42), cfg.Keyspace.IDReuseThreshold)
+	re.Equal(8, cfg.Keyspace.GetIDReuseLoadPageBuckets())
+	re.Equal(200*time.Millisecond, cfg.Keyspace.GetIDReuseLoadInterval())
+	re.Equal(20*time.Millisecond, cfg.Keyspace.GetIDReuseReclaimInterval())
+	for _, page := range []int{-1, 257} {
+		cfg.Keyspace.IDReuseLoadPageBuckets = page
+		re.Error(cfg.Keyspace.Validate())
+	}
+	cfg.Keyspace.IDReuseLoadPageBuckets = 1
+	cfg.Keyspace.IDReuseLoadInterval.Duration = -time.Second
+	re.Error(cfg.Keyspace.Validate())
 }
 
 func TestTLS(t *testing.T) {

@@ -1221,5 +1221,8 @@ func (suite *keyspaceTestSuite) TestTombstoneKeyspaceUnassignsMetaServiceGroup()
 	re.Equal(0, counts[groupID])
 }
 
-func (m *mockConfig) GetIDReuseBucketBytes() int      { return 32 }
-func (m *mockConfig) IsEncryptedIDReuseEnabled() bool { return true }
+func (m *mockConfig) GetIDReuseBucketBytes() int               { return 32 }
+func (m *mockConfig) GetIDReuseLoadPageBuckets() int           { return 64 }
+func (m *mockConfig) GetIDReuseLoadInterval() time.Duration    { return time.Millisecond }
+func (m *mockConfig) GetIDReuseReclaimInterval() time.Duration { return time.Nanosecond }
+func (m *mockConfig) IsEncryptedIDReuseEnabled() bool          { return true }
