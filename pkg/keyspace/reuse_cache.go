@@ -22,14 +22,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
 	"github.com/pingcap/log"
 
+	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/keyspace/constant"
 	"github.com/tikv/pd/pkg/storage/kv"
+	"github.com/tikv/pd/pkg/utils/keypath"
 )
 
 // StopIDReuse cancels and joins the old leader's loader before its cache can be
@@ -87,6 +90,19 @@ func (manager *Manager) loadNextFreeBucketPage(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	manager.reuse.mu.RLock()
+	ready := manager.reuse.revisionReady
+	hasMetadata := len(manager.reuse.metadataNeeds) != 0
+	manager.reuse.mu.RUnlock()
+	if !ready {
+		if err := manager.refreshReuseRevisionLocked(ctx); err != nil {
+			return err
+		}
+	}
+	manager.reuse.metadataTurn = !manager.reuse.metadataTurn
+	if hasMetadata && (manager.reuse.metadataTurn || manager.reuse.loadNext == manager.bucketCount()) {
+		return manager.loadReuseMetadataPageLocked(ctx)
+	}
 	// A conflict can invalidate an interval already traversed by the loader.
 	for bucket := range manager.reuse.invalidBuckets {
 		return manager.readFreeBucketIntervalLocked(ctx, bucket, bucket+1)
@@ -104,16 +120,28 @@ func (manager *Manager) loadNextFreeBucketPage(ctx context.Context) error {
 }
 
 func (manager *Manager) readFreeBucketIntervalLocked(ctx context.Context, start, end uint32) error {
+	manager.reuse.mu.RLock()
+	proof, ready := manager.reuse.revision, manager.reuse.revisionReady
+	manager.reuse.mu.RUnlock()
+	if !ready {
+		return errors.New("free bitmap revision is not loaded")
+	}
 	var values []kv.RevisionedValue
 	err := manager.store.RunInTxn(ctx, func(txn kv.Txn) error {
 		rt, err := revisionedTxn(txn)
 		if err != nil {
 			return err
 		}
+		rt.CompareModRevision(freeIDRevisionPath(), proof.ModRevision)
 		values, err = rt.LoadRangeWithRevision(bitmapPath(start), bitmapPath(end), int(end-start))
 		return err
 	})
 	if err != nil {
+		if errors.ErrorEqual(err, errs.ErrEtcdTxnConflict) {
+			manager.reuse.mu.Lock()
+			manager.reuse.revisionReady = false
+			manager.reuse.mu.Unlock()
+		}
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -127,6 +155,11 @@ func (manager *Manager) readFreeBucketIntervalLocked(ctx context.Context, start,
 		}
 		loaded[uint32(bucket)] = value
 	}
+	manager.reuse.mu.Lock()
+	defer manager.reuse.mu.Unlock()
+	if !manager.reuse.revisionReady || manager.reuse.revision.ModRevision != proof.ModRevision {
+		return errors.New("metadata changed during bitmap loading")
+	}
 	for bucket := start; bucket < end; bucket++ {
 		value, exists := loaded[bucket]
 		if !exists {
@@ -134,6 +167,116 @@ func (manager *Manager) readFreeBucketIntervalLocked(ctx context.Context, start,
 		}
 		manager.publishFreeBucketLocked(bucket, value.Value, value.ModRevision)
 	}
+	return nil
+}
+
+func (manager *Manager) refreshReuseRevisionLocked(ctx context.Context) error {
+	var revision kv.RevisionedValue
+	err := manager.store.RunInTxn(ctx, func(txn kv.Txn) error {
+		var err error
+		revision, err = readReuseRevision(txn)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	manager.reuse.mu.Lock()
+	defer manager.reuse.mu.Unlock()
+	if manager.reuse.revision.ModRevision > revision.ModRevision {
+		return errors.New("metadata changed during revision loading")
+	}
+	manager.reuse.revision, manager.reuse.revisionReady = revision, true
+	manager.reuse.metadataPages = make(map[uint32]reuseMetadataPage)
+	for start, need := range manager.reuse.metadataNeeds {
+		need.next = start
+		manager.reuse.metadataNeeds[start] = need
+	}
+	manager.reuse.buckets = make(map[uint32]kv.RevisionedValue)
+	manager.reuse.invalidBuckets = make(map[uint32]struct{})
+	manager.reuse.freeBuckets = nil
+	manager.reuse.loadNext = 0
+	return nil
+}
+
+func (manager *Manager) loadReuseMetadataPageLocked(ctx context.Context) error {
+	manager.reuse.mu.RLock()
+	selected, first := ^uint32(0), ^uint32(0)
+	for start := range manager.reuse.metadataNeeds {
+		first = min(first, start)
+		if start >= manager.reuse.metadataCursor {
+			selected = min(selected, start)
+		}
+	}
+	if selected == ^uint32(0) {
+		selected = first
+	}
+	need := manager.reuse.metadataNeeds[selected]
+	page := need.next
+	proof, ready := manager.reuse.revision, manager.reuse.revisionReady
+	manager.reuse.mu.RUnlock()
+	if first == ^uint32(0) || !ready {
+		return nil
+	}
+	var values []kv.RevisionedValue
+	err := manager.store.RunInTxn(ctx, func(txn kv.Txn) error {
+		rt, err := revisionedTxn(txn)
+		if err != nil {
+			return err
+		}
+		rt.CompareModRevision(freeIDRevisionPath(), proof.ModRevision)
+		values, err = rt.LoadRangeWithRevision(keypath.KeyspaceMetaPath(page*reuseMetadataPageIDs), keypath.KeyspaceMetaPath((page+1)*reuseMetadataPageIDs), int(reuseMetadataPageIDs))
+		return err
+	})
+	if err != nil {
+		if errors.ErrorEqual(err, errs.ErrEtcdTxnConflict) {
+			manager.reuse.mu.Lock()
+			manager.reuse.revisionReady = false
+			manager.reuse.mu.Unlock()
+		}
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var loaded reuseMetadataPage
+	for _, value := range values {
+		meta := &keyspacepb.KeyspaceMeta{}
+		if err := proto.Unmarshal([]byte(value.Value), meta); err != nil {
+			return err
+		}
+		if meta.GetId()/reuseMetadataPageIDs != page {
+			return errors.New("invalid keyspace metadata page")
+		}
+		mask := uint64(1) << (meta.GetId() % reuseMetadataPageIDs)
+		loaded.present |= mask
+		if meta.State == keyspacepb.KeyspaceState_TOMBSTONE {
+			loaded.tombstones |= mask
+		}
+		if manager.transactionalReuseConfig(meta.Config) {
+			loaded.transactional |= mask
+		}
+	}
+	manager.reuse.mu.Lock()
+	defer manager.reuse.mu.Unlock()
+	if !manager.reuse.revisionReady || manager.reuse.revision.ModRevision != proof.ModRevision {
+		return errors.New("metadata changed during page loading")
+	}
+	manager.reuse.metadataPages[page] = loaded
+	// Keep a stable interval key while advancing its frontier. A very large
+	// merged range cannot monopolize discovery ahead of unrelated Regions.
+	need = manager.reuse.metadataNeeds[selected]
+	delete(manager.reuse.metadataNeeds, selected)
+	for page++; page < need.end; page++ {
+		if _, exists := manager.reuse.metadataPages[page]; !exists {
+			need.next = page
+			manager.reuse.metadataNeeds[selected] = need
+			break
+		}
+	}
+	manager.reuse.metadataCursor = selected + 1
 	return nil
 }
 
@@ -158,21 +301,10 @@ func (manager *Manager) invalidateFreeBucketLocked(bucket uint32) {
 	manager.reuse.invalidBuckets[bucket] = struct{}{}
 }
 
-// cachedFreeBucketsLocked returns a bounded, rotating page of fully loaded
-// nonempty buckets. A cold or partially loaded cache can simply yield no ID.
+// cachedFreeBucketsLocked preserves ascending order. Unknown lower coverage is
+// checked by memoryOrderingProof rather than rediscovered by an etcd scan.
 func (manager *Manager) cachedFreeBucketsLocked() []uint32 {
-	buckets := manager.reuse.freeBuckets
-	start := sort.Search(len(buckets), func(i int) bool { return bitmapPath(buckets[i]) >= manager.reuse.scanStart })
-	if start == len(buckets) {
-		start = 0
-	}
-	end := min(start+freeIDScanLimit, len(buckets))
-	page := append([]uint32(nil), buckets[start:end]...)
-	manager.reuse.scanStart = bitmapPrefix()
-	if end < len(buckets) {
-		manager.reuse.scanStart = bitmapPath(buckets[end])
-	}
-	return page
+	return append([]uint32(nil), manager.reuse.freeBuckets...)
 }
 
 // changeCachedFreeBit adds a revision comparison without fetching the old value.
@@ -237,6 +369,9 @@ func (manager *Manager) reconcileReclaimedID(expected *keyspacepb.KeyspaceMeta) 
 		return err
 	})
 	if err != nil || !removed {
+		return false
+	}
+	if err := manager.refreshReuseRevisionLocked(manager.ctx); err != nil {
 		return false
 	}
 	id := expected.GetId()

@@ -17,6 +17,7 @@ package keyspace
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
@@ -90,18 +91,17 @@ func TestReclaimOrdersTombstonesAcrossMetadataHoles(t *testing.T) {
 	require.Equal(t, uint32(80), next.GetId())
 }
 
-func TestLowerMetadataScanDefersAtBound(t *testing.T) {
-	storage, cluster, manager := newReuseTestManager(t)
-	for id := uint32(1); id <= freeIDScanLimit; id++ {
+func TestLargeMetadataRangeDoesNotPermanentlyDeferClaim(t *testing.T) {
+	_, cluster, manager := newReuseTestManager(t)
+	for id := uint32(1); id <= 64; id++ {
 		saveReuseTestMeta(t, manager, id, keyspacepb.KeyspaceState_ENABLED)
 	}
 	region := newReuseTestRegion(1, 420).Clone(core.WithEndKey(MakeRegionBound(100).TxnRightBound))
 	cluster.PutRegion(region)
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		ready, err := manager.lowerTombstonesReclaimed(txn, region, 99, false)
-		require.False(t, ready)
-		return err
-	}))
+	seedReuseTestBit(t, manager, 99, true)
+	meta, err := manager.tryCreateReusedKeyspace("large-range", nil, 1)
+	require.NoError(t, err)
+	require.Equal(t, uint32(99), meta.GetId())
 }
 
 func TestClaimsPreserveRegionOrderAcrossBitmapPagesWithoutWaitingForSplits(t *testing.T) {
@@ -112,15 +112,8 @@ func TestClaimsPreserveRegionOrderAcrossBitmapPagesWithoutWaitingForSplits(t *te
 		id := bucket*256 + 42
 		seedReuseTestBit(t, manager, id, true)
 	}
-	// Begin after a complete page; the higher candidate must not overtake ID 42.
-	manager.reuse.scanStart = bitmapPath(32)
-	created, err := manager.tryCreateReusedKeyspace("later-page", nil, 1)
-	require.NoError(t, err)
-	require.Nil(t, created)
 	for bucket := uint32(0); bucket <= 1; bucket++ {
-		// Put the cursor on the lowest remaining bucket. Pending splits never finish.
-		manager.reuse.scanStart = bitmapPath(bucket)
-		created, err = manager.tryCreateReusedKeyspace(fmt.Sprintf("tenant-%d", bucket), nil, 1)
+		created, err := manager.tryCreateReusedKeyspace(fmt.Sprintf("tenant-%d", bucket), nil, 1)
 		require.NoError(t, err)
 		require.NotNil(t, created)
 		require.Equal(t, bucket*256+42, created.GetId())
@@ -165,7 +158,11 @@ type orderedReuseTxn struct {
 }
 
 func (t *orderedReuseTxn) LoadRangeWithRevision(key, end string, limit int) ([]kv.RevisionedValue, error) {
-	return t.Txn.(kv.RevisionedTxn).LoadRangeWithRevision(key, end, limit)
+	values, err := t.Txn.(kv.RevisionedTxn).LoadRangeWithRevision(key, end, limit)
+	if err == nil && t.owner.afterRange != nil {
+		t.owner.afterRange(key)
+	}
+	return values, err
 }
 func (t *orderedReuseTxn) CompareModRevision(key string, revision int64) {
 	t.Txn.(kv.RevisionedTxn).CompareModRevision(key, revision)
@@ -204,15 +201,13 @@ func TestClaimRevisionRejectsNewLowerBitmapBucket(t *testing.T) {
 	_, cluster, manager := newReuseTestManagerWithKV(t, backend)
 	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(300).TxnRightBound)))
 	seedReuseTestBit(t, manager, 298, true)
-	manager.reuse.scanStart = bitmapPath(1)
 	injected := false
-	backend.afterRange = func(key string) {
-		if key != bitmapPath(0) || injected {
+	backend.afterLoad = func(key string) {
+		if key != keypath.KeyspaceMetaPath(298) || injected {
 			return
 		}
 		injected = true
-		// Insert a previously absent lower bucket after the range read. Only the
-		// revision read before scans can detect this phantom at transaction commit.
+		// A writer changes the existing revision after the memory proof was taken.
 		require.NoError(t, backend.Base.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 			if err := manager.changeFreeBit(txn, 42, true); err != nil {
 				return err
@@ -256,15 +251,15 @@ func TestClaimMutexCoversCommittedMetadataBeforePendingCache(t *testing.T) {
 	require.Contains(t, manager.reuse.pending, uint32(43))
 }
 
-func TestClaimBoundsEtcdComparisonsAcrossBlockedRegions(t *testing.T) {
+func TestClaimBoundsEtcdComparisonsAcrossLargeRegions(t *testing.T) {
 	_, client, clean := etcdutil.NewTestEtcdCluster(t, 1, nil)
 	t.Cleanup(clean)
 	_, cluster, manager := newReuseTestManagerWithKV(t, kv.NewEtcdKVBase(client))
-	// Each blocked Region exhausts the bounded lower-metadata scan. Combining
-	// these checks in one transaction would exceed etcd's default 128-op limit.
+	// These formerly exhausted the 32-row scan. Memory proofs do not add
+	// predecessor comparisons to the atomic claim transaction.
 	for bucket := uint32(0); bucket < 5; bucket++ {
 		first := bucket*256 + 1
-		for id := first; id < first+freeIDScanLimit; id++ {
+		for id := first; id < first+32; id++ {
 			saveReuseTestMeta(t, manager, id, keyspacepb.KeyspaceState_ENABLED)
 		}
 		candidate := bucket*256 + 42
@@ -274,10 +269,28 @@ func TestClaimBoundsEtcdComparisonsAcrossBlockedRegions(t *testing.T) {
 	const eligible = uint32(5*256 + 42)
 	cluster.PutRegion(newReuseTestRegion(eligible, uint64(eligible)).Clone(core.WithEndKey(MakeRegionBound(eligible + 1).TxnRightBound)))
 	seedReuseTestBit(t, manager, eligible, true)
-	created, err := manager.tryCreateReusedKeyspace("after-blocked-regions", nil, 1)
-	require.NoError(t, err)
-	require.NotNil(t, created)
-	require.Equal(t, eligible, created.GetId())
+	for bucket := uint32(0); bucket <= 5; bucket++ {
+		created, err := manager.tryCreateReusedKeyspace(fmt.Sprintf("large-region-%d", bucket), nil, 1)
+		require.NoError(t, err)
+		require.NotNil(t, created)
+		require.Equal(t, bucket*256+42, created.GetId())
+	}
+}
+
+func loadFreeIDRevision(txn kv.Txn) (uint64, error) {
+	value, err := txn.Load(freeIDRevisionPath())
+	if err != nil || value == "" {
+		return 0, err
+	}
+	return strconv.ParseUint(value, 10, 64)
+}
+
+func advanceFreeIDRevision(txn kv.Txn) error {
+	revision, err := loadFreeIDRevision(txn)
+	if err != nil {
+		return err
+	}
+	return txn.Save(freeIDRevisionPath(), strconv.FormatUint(revision+1, 10))
 }
 
 func (t *orderedReuseTxn) Load(key string) (string, error) {
@@ -292,33 +305,25 @@ func TestClaimRejectsConcurrentCreationInMetadataHole(t *testing.T) {
 	_, client, clean := etcdutil.NewTestEtcdCluster(t, 1, nil)
 	t.Cleanup(clean)
 	backend := &orderedReuseKV{Base: kv.NewEtcdKVBase(client)}
-	storage, cluster, manager := newReuseTestManagerWithKV(t, backend)
+	_, cluster, manager := newReuseTestManagerWithKV(t, backend)
 	saveReuseTestMeta(t, manager, 42, keyspacepb.KeyspaceState_TOMBSTONE)
 	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(81).TxnRightBound)))
 	seedReuseTestBit(t, manager, 80, true)
 	injected := false
 	backend.afterLoad = func(key string) {
-		if key != keypath.KeyspaceMetaPath(43) || injected {
+		if key != keypath.KeyspaceMetaPath(80) || injected {
 			return
 		}
 		injected = true
-		// Ordinary creation fills the hole without changing free-ID revision. The
-		// claim must conflict on its absent-neighbor read, then defer on retry.
-		require.NoError(t, backend.Base.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-			return manager.store.SaveKeyspaceMeta(txn, &keyspacepb.KeyspaceMeta{
-				Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: 43}, Name: "fills-hole", State: keyspacepb.KeyspaceState_DISABLED,
-			})
+		// Ordinary creation now participates in the same metadata/free revision.
+		require.NoError(t, manager.saveNewKeyspace(&keyspacepb.KeyspaceMeta{
+			Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: 43}, Name: "fills-hole", State: keyspacepb.KeyspaceState_DISABLED,
 		}))
 	}
 	created, err := manager.tryCreateReusedKeyspace("after-hole", nil, 1)
 	require.NoError(t, err)
 	require.True(t, injected)
 	require.Nil(t, created)
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		revision, err := loadFreeIDRevision(txn)
-		require.Zero(t, revision)
-		return err
-	}))
 	_, err = manager.LoadKeyspaceByID(80)
 	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
 }

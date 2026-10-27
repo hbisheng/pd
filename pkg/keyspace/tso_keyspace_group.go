@@ -938,7 +938,7 @@ func (m *GroupManager) RemoveKeyspacesFromGroup(groupID uint32, km *Manager, key
 		err error
 	)
 
-	if err := m.store.RunInTxn(m.ctx, func(txn kv.Txn) error {
+	if err := km.runMetadataTxn(func(txn kv.Txn) error {
 		// Load the keyspace group
 		kg, err = m.store.LoadKeyspaceGroup(txn, groupID)
 		if err != nil {

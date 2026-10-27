@@ -331,16 +331,8 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 
 	// The ordinary Create path retains its original allocation, split, timeout,
 	// rollback, and encrypted-keyspace behavior.
-	newID, err := manager.allocID()
-	if err != nil {
-		return nil, err
-	}
-	tracer.SetKeyspace(newID, request.Name)
-	tracer.OnAllocateIDFinished()
-
 	// Create a disabled keyspace meta for tikv-server to get the config on keyspace split.
 	keyspace := &keyspacepb.KeyspaceMeta{
-		Keyspace:       &keyspacepb.KeyspaceMeta_Id{Id: newID},
 		Name:           request.Name,
 		State:          keyspacepb.KeyspaceState_DISABLED,
 		CreatedAt:      request.CreateTime,
@@ -358,12 +350,15 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 		)
 		return nil, err
 	}
+	newID := keyspace.GetId()
+	tracer.SetKeyspace(newID, request.Name)
+	tracer.OnAllocateIDFinished()
 	tracer.OnSaveKeyspaceMetaFinished()
 
 	// Split keyspace region.
 	err = manager.splitKeyspaceRegion(newID, manager.config.ToWaitRegionSplit(), boundType)
 	if err != nil {
-		err2 := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		err2 := manager.runMetadataTxn(func(txn kv.Txn) error {
 			idPath := keypath.KeyspaceIDPath(request.Name)
 			metaPath := keypath.KeyspaceMetaPath(newID)
 			e := txn.Remove(idPath)
@@ -510,7 +505,7 @@ func (manager *Manager) CreateKeyspaceByID(request *CreateKeyspaceByIDRequest) (
 	if err != nil {
 		idPath := keypath.KeyspaceIDPath(name)
 		metaPath := keypath.KeyspaceMetaPath(id)
-		err2 := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		err2 := manager.runMetadataTxn(func(txn kv.Txn) error {
 			if err := txn.Remove(idPath); err != nil {
 				return err
 			}
@@ -560,7 +555,23 @@ func (manager *Manager) saveNewKeyspace(keyspace *keyspacepb.KeyspaceMeta) error
 	manager.metaLock.Lock(keyspace.GetId())
 	defer manager.metaLock.Unlock(keyspace.GetId())
 
-	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+	err := manager.runMetadataTxn(func(txn kv.Txn) error {
+		// Check the name before allocating an ordinary ID, in this same mutation
+		// transaction. Duplicate requests neither add a preflight read nor burn IDs.
+		nameExists, _, err := manager.store.LoadKeyspaceID(txn, keyspace.Name)
+		if err != nil {
+			return err
+		}
+		if nameExists {
+			return errs.ErrKeyspaceExists
+		}
+		if keyspace.Keyspace == nil {
+			id, err := manager.allocID()
+			if err != nil {
+				return err
+			}
+			keyspace.Keyspace = &keyspacepb.KeyspaceMeta_Id{Id: id}
+		}
 		if manager.config.IsIDReuseEnabled() {
 			width := uint32(manager.bitmapBytes() * 8)
 			bucket, err := txn.Load(bitmapPath(keyspace.GetId() / width))
@@ -574,13 +585,6 @@ func (manager *Manager) saveNewKeyspace(keyspace *keyspacepb.KeyspaceMeta) error
 		}
 		// Save keyspace ID.
 		// Check if keyspace with that name already exists.
-		nameExists, _, err := manager.store.LoadKeyspaceID(txn, keyspace.Name)
-		if err != nil {
-			return err
-		}
-		if nameExists {
-			return errs.ErrKeyspaceExists
-		}
 		err = manager.store.SaveKeyspaceID(txn, keyspace.GetId(), keyspace.Name)
 		if err != nil {
 			return err
@@ -920,7 +924,7 @@ func (manager *Manager) runTxnWithMetaGroupLock(f func(txn kv.Txn) error) error 
 		manager.mgm.RLock()
 		defer manager.mgm.RUnlock()
 	}
-	return manager.store.RunInTxn(manager.ctx, f)
+	return manager.runMetadataTxn(f)
 }
 
 func (manager *Manager) updateKeyspaceConfigTxn(name string, update func(meta *keyspacepb.KeyspaceMeta) error) (*keyspacepb.KeyspaceMeta, error) {
@@ -950,6 +954,7 @@ func (manager *Manager) updateKeyspaceConfigTxn(name string, update func(meta *k
 			return errors.Errorf("cannot change config for keyspace with state %s", meta.GetState().String())
 		}
 		// Initialize meta's config map if it's nil.
+		clear(oldConfig) // A revision conflict can retry this callback.
 		if meta.GetConfig() == nil {
 			meta.Config = map[string]string{}
 		}
@@ -1026,7 +1031,7 @@ func (manager *Manager) UpdateKeyspaceState(name string, newState keyspacepb.Key
 		return nil, err
 	}
 	var meta *keyspacepb.KeyspaceMeta
-	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+	err := manager.runMetadataTxn(func(txn kv.Txn) error {
 		// First get KeyspaceID from Name.
 		loaded, id, err := manager.store.LoadKeyspaceID(txn, name)
 		if err != nil {
@@ -1092,8 +1097,10 @@ func (manager *Manager) RemoveKeyspace(txn kv.Txn, id uint32) error {
 	if err != nil {
 		return err
 	}
-	manager.keyspaceNameLookup.Delete(id)
-	manager.keyspaceStateLookup.Delete(id)
+	if !manager.config.IsIDReuseEnabled() {
+		manager.keyspaceNameLookup.Delete(id)
+		manager.keyspaceStateLookup.Delete(id)
+	}
 	// Keep the meta-service group assignment accounting in sync within the same
 	// txn. Without this, removed keyspaces leak count and could permanently block
 	// deleting an otherwise-empty group.
@@ -1110,7 +1117,7 @@ func (manager *Manager) UpdateKeyspaceStateByID(id uint32, newState keyspacepb.K
 	}
 	var meta *keyspacepb.KeyspaceMeta
 	var err error
-	err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+	err = manager.runMetadataTxn(func(txn kv.Txn) error {
 		manager.metaLock.Lock(id)
 		defer manager.metaLock.Unlock(id)
 		// Load keyspace by id.
@@ -1357,6 +1364,11 @@ func (manager *Manager) allocID() (uint32, error) {
 
 // PatrolKeyspaceAssignment is used to patrol all keyspaces and assign them to the keyspace groups.
 func (manager *Manager) PatrolKeyspaceAssignment(startKeyspaceID, endKeyspaceID uint32) error {
+	batchSize := etcdutil.MaxEtcdTxnOps
+	if manager.config.IsIDReuseEnabled() {
+		// Reserve one operation each for the group and shared metadata fence.
+		batchSize -= 2
+	}
 	if startKeyspaceID > manager.nextPatrolStartID {
 		manager.nextPatrolStartID = startKeyspaceID
 	}
@@ -1392,7 +1404,7 @@ func (manager *Manager) PatrolKeyspaceAssignment(startKeyspaceID, endKeyspaceID 
 	}()
 	for moreToPatrol {
 		var defaultKeyspaceGroup *endpoint.KeyspaceGroup
-		err = manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		err = manager.runMetadataTxn(func(txn kv.Txn) error {
 			var err error
 			defaultKeyspaceGroup, err = manager.kgm.store.LoadKeyspaceGroup(txn, constant.DefaultKeyspaceGroupID)
 			if err != nil {
@@ -1407,7 +1419,7 @@ func (manager *Manager) PatrolKeyspaceAssignment(startKeyspaceID, endKeyspaceID 
 			if defaultKeyspaceGroup.IsMerging() {
 				return errs.ErrKeyspaceGroupInMerging.FastGenByArgs(constant.DefaultKeyspaceGroupID)
 			}
-			keyspaces, err := manager.store.LoadRangeKeyspace(txn, manager.nextPatrolStartID, etcdutil.MaxEtcdTxnOps)
+			keyspaces, err := manager.store.LoadRangeKeyspace(txn, manager.nextPatrolStartID, batchSize)
 			if err != nil {
 				return err
 			}
@@ -1417,9 +1429,9 @@ func (manager *Manager) PatrolKeyspaceAssignment(startKeyspaceID, endKeyspaceID 
 				currentStartID = keyspaces[0].GetId()
 				nextStartID = keyspaces[keyspaceNum-1].GetId() + 1
 			}
-			// If there are less than ` etcdutil.MaxEtcdTxnOps` keyspaces or the next start ID reaches the end,
+			// If there are fewer than batchSize keyspaces or the next start ID reaches the end,
 			// there is no need to patrol again.
-			moreToPatrol = keyspaceNum == etcdutil.MaxEtcdTxnOps
+			moreToPatrol = keyspaceNum == batchSize
 			var (
 				assigned            = false
 				keyspaceIDsToUnlock = make([]uint32, 0, keyspaceNum)

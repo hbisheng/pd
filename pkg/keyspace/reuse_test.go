@@ -60,6 +60,34 @@ func newReuseTestManagerWithKV(t *testing.T, backend kv.Base) (*endpoint.Storage
 }
 func saveReuseTestMeta(t *testing.T, manager *Manager, id uint32, state keyspacepb.KeyspaceState) {
 	require.NoError(t, manager.saveNewKeyspace(&keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: state.String() + "-" + string(rune(id+'a')), State: state, Config: map[string]string{}, CreatedAt: 1, StateChangedAt: 2}))
+	warmReuseTestCoverage(t, manager, id+1)
+}
+
+// Fixtures explicitly warm coverage. Production Create never loads it inline.
+func warmReuseTestCoverage(t *testing.T, manager *Manager, end uint32) {
+	t.Helper()
+	manager.reuse.claimMu.Lock()
+	defer manager.reuse.claimMu.Unlock()
+	manager.reuse.mu.RLock()
+	ready := manager.reuse.revisionReady
+	manager.reuse.mu.RUnlock()
+	if !ready {
+		require.NoError(t, manager.refreshReuseRevisionLocked(manager.ctx))
+	}
+	for bucket := uint32(0); bucket <= end/uint32(manager.bitmapBytes()*8); bucket++ {
+		if _, loaded := manager.reuse.buckets[bucket]; !loaded {
+			require.NoError(t, manager.readFreeBucketIntervalLocked(manager.ctx, bucket, bucket+1))
+		}
+	}
+	manager.reuse.mu.Lock()
+	ready = manager.metadataCoverageLocked(0, end)
+	manager.reuse.mu.Unlock()
+	for !ready {
+		require.NoError(t, manager.loadReuseMetadataPageLocked(manager.ctx))
+		manager.reuse.mu.Lock()
+		ready = manager.metadataCoverageLocked(0, end)
+		manager.reuse.mu.Unlock()
+	}
 }
 
 // changeFreeBit seeds authoritative storage in tests, including simulated
@@ -83,12 +111,13 @@ func (manager *Manager) changeFreeBit(txn kv.Txn, id uint32, free bool) error {
 func seedReuseTestBit(t *testing.T, manager *Manager, id uint32, free bool) {
 	t.Helper()
 	manager.reuse.claimMu.Lock()
-	defer manager.reuse.claimMu.Unlock()
 	require.NoError(t, manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error { return manager.changeFreeBit(txn, id, free) }))
 	bucket := id / uint32(manager.bitmapBytes()*8)
 	manager.invalidateFreeBucketLocked(bucket)
 	_, err := manager.loadFreeBucketLocked(bucket)
 	require.NoError(t, err)
+	manager.reuse.claimMu.Unlock()
+	warmReuseTestCoverage(t, manager, id+1)
 }
 
 func prepareIsolatedReuse(t *testing.T, manager *Manager, cluster *mockcluster.Cluster) {
@@ -197,6 +226,7 @@ func TestReclaimRejectsProtectedIDsAndRawKeyspaces(t *testing.T) {
 		State:  keyspacepb.KeyspaceState_TOMBSTONE,
 		Config: map[string]string{RegionBoundType: "raw"},
 	}))
+	warmReuseTestCoverage(t, manager, 43)
 	cluster.PutRegion(newReuseTestRegion(42, 42))
 	require.ErrorContains(t, manager.RequestKeyspaceReclaim(42), "transactional")
 }

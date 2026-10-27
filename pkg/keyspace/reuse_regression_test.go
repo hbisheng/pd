@@ -73,9 +73,6 @@ func TestFreeBitmapScanReachesLaterEligibleBucket(t *testing.T) {
 	cluster.PutRegion(newReuseTestRegion(eligible, uint64(eligible)).Clone(core.WithEndKey(MakeRegionBound(eligible + 1).TxnRightBound)))
 	created, err := manager.tryCreateReusedKeyspace("first-page", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
 	require.NoError(t, err)
-	require.Nil(t, created)
-	created, err = manager.tryCreateReusedKeyspace("later-page", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
-	require.NoError(t, err)
 	require.NotNil(t, created)
 	require.Equal(t, eligible, created.GetId())
 }
@@ -93,18 +90,20 @@ func TestReuseStartupDoesNotScanMetadata(t *testing.T) {
 func TestFreeIDRevisionChangesWithReclaimAndClaim(t *testing.T) {
 	storage, cluster, manager := newReuseTestManager(t)
 	prepareIsolatedReuse(t, manager, cluster)
+	var before uint64
+	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { var err error; before, err = loadFreeIDRevision(txn); return err }))
 	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		revision, err := loadFreeIDRevision(txn)
-		require.Equal(t, uint64(1), revision)
+		require.Equal(t, before+1, revision)
 		return err
 	}))
 	_, err := manager.tryCreateReusedKeyspace("new-name", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
 	require.NoError(t, err)
 	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		revision, err := loadFreeIDRevision(txn)
-		require.Equal(t, uint64(2), revision)
+		require.Equal(t, before+2, revision)
 		return err
 	}))
 }

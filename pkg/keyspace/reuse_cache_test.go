@@ -42,6 +42,7 @@ type bitmapEtcdRecorder struct {
 	mu           sync.Mutex
 	reads        []clientv3.Op
 	comparisons  []clientv3.Cmp
+	transactions int
 	beforeCommit func() error
 	afterCommit  func() error
 	beforeRead   func(context.Context)
@@ -72,6 +73,9 @@ type bitmapRecordedTxn struct {
 }
 
 func (r *bitmapEtcdRecorder) Txn(ctx context.Context) clientv3.Txn {
+	r.mu.Lock()
+	r.transactions++
+	r.mu.Unlock()
 	return &bitmapRecordedTxn{Txn: r.KV.Txn(ctx), owner: r}
 }
 func (t *bitmapRecordedTxn) If(cmps ...clientv3.Cmp) clientv3.Txn {
@@ -171,6 +175,10 @@ func TestFreeBitmapCacheConflictReloadPreservesDistinctBits(t *testing.T) {
 	require.NoError(t, err)
 	created, err := manager.tryCreateReusedKeyspace("conflicted", nil, 1)
 	require.NoError(t, err)
+	require.Nil(t, created)
+	warmReuseTestCoverage(t, manager, 45)
+	created, err = manager.tryCreateReusedKeyspace("conflicted", nil, 1)
+	require.NoError(t, err)
 	require.Equal(t, uint32(42), created.GetId())
 	require.NotZero(t, manager.reuse.buckets[0].Value[43/8]&(1<<(43%8)))
 	created, err = manager.tryCreateReusedKeyspace("preserved", nil, 2)
@@ -191,8 +199,9 @@ func TestFreeBitmapCacheReconcilesLostClaimResponse(t *testing.T) {
 	recorder.afterCommit = nil
 	require.NoError(t, manager.loadNextFreeBucketPage(manager.ctx))
 	require.Zero(t, manager.reuse.buckets[0].Value[42/8]&(1<<(42%8)))
-	_, err = manager.tryCreateReusedKeyspace("lost-response", nil, 1)
+	_, err = manager.CreateKeyspace(&CreateKeyspaceRequest{Name: "lost-response", CreateTime: 1})
 	require.ErrorIs(t, err, errs.ErrKeyspaceExists)
+	warmReuseTestCoverage(t, manager, 44)
 	created, err = manager.tryCreateReusedKeyspace("other-owner", nil, 2)
 	require.NoError(t, err)
 	require.Equal(t, uint32(43), created.GetId())
@@ -210,7 +219,7 @@ func TestFreeBitmapCacheFailedTransactionKeepsOwnerAndBitAtomic(t *testing.T) {
 	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
 	require.Contains(t, manager.reuse.invalidBuckets, uint32(0))
 	recorder.beforeCommit = nil
-	require.NoError(t, manager.loadNextFreeBucketPage(manager.ctx))
+	warmReuseTestCoverage(t, manager, 43)
 	created, err = manager.tryCreateReusedKeyspace("retry", nil, 1)
 	require.NoError(t, err)
 	require.Equal(t, uint32(42), created.GetId())
@@ -260,6 +269,10 @@ func TestFreeBitmapCacheLoadsBoundedEmptyIntervalsAndRestarts(t *testing.T) {
 	}
 	created, err = manager.tryCreateReusedKeyspace("loaded", nil, 2)
 	require.NoError(t, err)
+	require.Nil(t, created)
+	warmReuseTestCoverage(t, manager, id+1)
+	created, err = manager.tryCreateReusedKeyspace("loaded", nil, 2)
+	require.NoError(t, err)
 	require.Equal(t, id, created.GetId())
 	require.NoError(t, manager.StartIDReuse())
 	require.Empty(t, manager.reuse.buckets)
@@ -275,6 +288,8 @@ func TestFreeBitmapReclaimLoadsUncachedBucketBeforeChangingBit(t *testing.T) {
 	manager.reuse.buckets = make(map[uint32]kv.RevisionedValue)
 	manager.reuse.freeBuckets = nil
 	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
+	require.NoError(t, manager.RequestKeyspaceReclaim(42))
+	warmReuseTestCoverage(t, manager, 43)
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
 	value := manager.reuse.buckets[0]
 	require.NotZero(t, value.Value[42/8]&(1<<(42%8)))
@@ -378,6 +393,7 @@ func TestFreeBitmapReconcilesLostReclaimResponse(t *testing.T) {
 	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
 	require.NotZero(t, manager.reuse.buckets[0].Value[42/8]&(1<<(42%8)))
 	require.Positive(t, manager.reuse.buckets[0].ModRevision)
+	warmReuseTestCoverage(t, manager, 43)
 	created, err := manager.tryCreateReusedKeyspace("after-lost-reclaim", nil, 1)
 	require.NoError(t, err)
 	require.Equal(t, uint32(42), created.GetId())
