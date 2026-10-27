@@ -116,6 +116,23 @@ type Txn interface {
 	BaseReadWrite
 }
 
+// RevisionedValue is a committed value and its last modification revision.
+// ModRevision is zero for an absent key.
+type RevisionedValue struct {
+	Key, Value  string
+	ModRevision int64
+}
+
+// RevisionedTxn supports cached reads with optimistic revision checks. Reads do
+// not add comparisons: callers must explicitly compare the revisions they use.
+// CommitRevision is available only after the enclosing RunInTxn succeeds.
+type RevisionedTxn interface {
+	Txn
+	LoadRangeWithRevision(key, endKey string, limit int) ([]RevisionedValue, error)
+	CompareModRevision(key string, revision int64)
+	CommitRevision() int64
+}
+
 // Base is an abstract interface for load/save pd cluster data.
 type Base interface {
 	BaseReadWrite

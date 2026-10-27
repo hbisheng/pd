@@ -22,17 +22,21 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 
+	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/utils/syncutil"
 )
 
 type memoryKV struct {
 	syncutil.RWMutex
-	tree *btree.BTreeG[memoryKVItem]
+	tree         *btree.BTreeG[memoryKVItem]
+	revision     int64
+	modRevisions map[string]int64
 }
 
 // NewMemoryKV returns an in-memory kvBase.
 func NewMemoryKV() Base {
 	return &memoryKV{
+		modRevisions: make(map[string]int64),
 		tree: btree.NewG(2, func(i, j memoryKVItem) bool {
 			return i.Less(&j)
 		}),
@@ -87,6 +91,8 @@ func (kv *memoryKV) Save(key, value string) error {
 	kv.Lock()
 	defer kv.Unlock()
 	kv.tree.ReplaceOrInsert(memoryKVItem{key, value})
+	kv.revision++
+	kv.modRevisions[key] = kv.revision
 	return nil
 }
 
@@ -96,6 +102,8 @@ func (kv *memoryKV) Remove(key string) error {
 	defer kv.Unlock()
 
 	kv.tree.Delete(memoryKVItem{key, ""})
+	kv.revision++
+	delete(kv.modRevisions, key)
 	return nil
 }
 
@@ -104,9 +112,34 @@ type memTxn struct {
 	kv  *memoryKV
 	ctx context.Context
 	// mu protects ops.
-	mu  syncutil.Mutex
-	ops []*op
+	mu          syncutil.Mutex
+	ops         []*op
+	comparisons map[string]int64
+	revision    int64
 }
+
+func (txn *memTxn) LoadRangeWithRevision(key, endKey string, limit int) ([]RevisionedValue, error) {
+	if err := txn.ctx.Err(); err != nil {
+		return nil, err
+	}
+	txn.kv.RLock()
+	defer txn.kv.RUnlock()
+	values := make([]RevisionedValue, 0)
+	txn.kv.tree.AscendRange(memoryKVItem{key, ""}, memoryKVItem{endKey, ""}, func(item memoryKVItem) bool {
+		values = append(values, RevisionedValue{Key: item.key, Value: item.value, ModRevision: txn.kv.modRevisions[item.key]})
+		return limit <= 0 || len(values) < limit
+	})
+	return values, nil
+}
+
+func (txn *memTxn) CompareModRevision(key string, revision int64) {
+	if txn.comparisons == nil {
+		txn.comparisons = make(map[string]int64)
+	}
+	txn.comparisons[key] = revision
+}
+
+func (txn *memTxn) CommitRevision() int64 { return txn.revision }
 
 // op represents an Operation that memKV can execute.
 type op struct {
@@ -186,15 +219,26 @@ func (txn *memTxn) commit() error {
 	// making the execution atomic.
 	txn.kv.Lock()
 	defer txn.kv.Unlock()
+	for key, revision := range txn.comparisons {
+		if txn.kv.modRevisions[key] != revision {
+			return errs.ErrEtcdTxnConflict.FastGenByArgs()
+		}
+	}
+	if len(txn.ops) > 0 {
+		txn.kv.revision++
+	}
 	// Execute mutations in order.
 	// Note: executions in mem_kv never fails.
 	for _, op := range txn.ops {
 		switch op.t {
 		case tPut:
 			txn.kv.tree.ReplaceOrInsert(memoryKVItem{op.key, op.val})
+			txn.kv.modRevisions[op.key] = txn.kv.revision
 		case tDelete:
 			txn.kv.tree.Delete(memoryKVItem{op.key, ""})
+			delete(txn.kv.modRevisions, op.key)
 		}
 	}
+	txn.revision = txn.kv.revision
 	return nil
 }

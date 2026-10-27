@@ -206,6 +206,7 @@ type etcdTxn struct {
 	ctx        context.Context
 	conditions []clientv3.Cmp
 	operations []clientv3.Op
+	revision   int64
 }
 
 // RunInTxn runs user provided function f in a transaction.
@@ -280,8 +281,31 @@ func (txn *etcdTxn) LoadRange(key, endKey string, limit int) (keys []string, val
 	return keys, values, err
 }
 
+func (txn *etcdTxn) LoadRangeWithRevision(key, endKey string, limit int) ([]RevisionedValue, error) {
+	resp, err := etcdutil.EtcdKVGetWithContext(txn.ctx, txn.kv.client, key,
+		clientv3.WithRange(endKey), clientv3.WithLimit(int64(limit)))
+	if err != nil {
+		return nil, err
+	}
+	values := make([]RevisionedValue, 0, len(resp.Kvs))
+	for _, item := range resp.Kvs {
+		values = append(values, RevisionedValue{Key: string(item.Key), Value: string(item.Value), ModRevision: item.ModRevision})
+	}
+	return values, nil
+}
+
+func (txn *etcdTxn) CompareModRevision(key string, revision int64) {
+	// etcd reports ModRevision zero for an absent key, including deleted keys.
+	txn.conditions = append(txn.conditions, clientv3.Compare(clientv3.ModRevision(key), "=", revision))
+}
+
+func (txn *etcdTxn) CommitRevision() int64 { return txn.revision }
+
 // commit perform the operations on etcd, with pre-condition that values observed by user have not been changed.
 func (txn *etcdTxn) commit() error {
+	if len(txn.conditions) == 0 && len(txn.operations) == 0 {
+		return txn.ctx.Err()
+	}
 	failpoint.Inject("slowTxn", func() {
 		time.Sleep(10 * time.Second)
 	})
@@ -296,6 +320,7 @@ func (txn *etcdTxn) commit() error {
 	if !resp.Succeeded {
 		return errs.ErrEtcdTxnConflict.FastGenByArgs()
 	}
+	txn.revision = resp.Header.Revision
 	return nil
 }
 
