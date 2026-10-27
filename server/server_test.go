@@ -36,6 +36,19 @@ import (
 
 var errTestFollowerRegionStorage = stderrors.New("test follower region storage error")
 
+func TestKeyspaceIDReuseSwitchRequiresRestart(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled-%t", enabled), func(t *testing.T) {
+			oldCfg := &config.KeyspaceConfig{EnableIDReuse: enabled}
+			newCfg := &config.KeyspaceConfig{EnableIDReuse: !enabled}
+			s := &Server{}
+			require.ErrorContains(t, s.SetKeyspaceConfig(oldCfg, newCfg), "restart PD")
+			require.ErrorContains(t, s.SetKeyspaceConfigWithoutKeyspaceManagerUpdate(oldCfg, newCfg), "restart PD")
+			require.Equal(t, enabled, oldCfg.EnableIDReuse)
+		})
+	}
+}
+
 func TestResetFollowerRegionCacheRequiresRegionStorage(t *testing.T) {
 	re := require.New(t)
 	cfg := config.NewConfig()

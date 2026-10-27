@@ -1242,6 +1242,11 @@ func (s *Server) UpdateKeyspaceConfig(newCfg *config.KeyspaceConfig) {
 }
 
 func (s *Server) setKeyspaceConfigInner(oldCfg, newCfg *config.KeyspaceConfig, updateKeyspaceManager bool) error {
+	// Re-enabling a warm cache after unfenced disabled-mode writes is unsafe.
+	// Startup creates fresh coverage before any reuse can become eligible.
+	if oldCfg.EnableIDReuse != newCfg.EnableIDReuse {
+		return errors.New("enable-id-reuse is startup-only; restart PD to change it")
+	}
 	if err := newCfg.Validate(); err != nil {
 		return err
 	}
