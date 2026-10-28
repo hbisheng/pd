@@ -87,27 +87,6 @@ func TestReuseStartupDoesNotScanMetadata(t *testing.T) {
 	}
 }
 
-func TestFreeIDRevisionChangesWithReclaimAndClaim(t *testing.T) {
-	storage, cluster, manager := newReuseTestManager(t)
-	prepareIsolatedReuse(t, manager, cluster)
-	var before uint64
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error { var err error; before, err = loadFreeIDRevision(txn); return err }))
-	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
-	require.NoError(t, manager.RequestKeyspaceReclaim(42))
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		revision, err := loadFreeIDRevision(txn)
-		require.Equal(t, before+1, revision)
-		return err
-	}))
-	_, err := manager.tryCreateReusedKeyspace("new-name", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 1)
-	require.NoError(t, err)
-	require.NoError(t, storage.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		revision, err := loadFreeIDRevision(txn)
-		require.Equal(t, before+2, revision)
-		return err
-	}))
-}
-
 func TestSplitBeforeClaimIsCanceledWithoutInitialization(t *testing.T) {
 	backend := &reuseHookKV{Base: kv.NewMemoryKV()}
 	_, cluster, manager := newReuseTestManagerWithKV(t, backend)

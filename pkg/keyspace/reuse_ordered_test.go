@@ -17,7 +17,6 @@ package keyspace
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"testing"
 
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
@@ -66,7 +65,7 @@ func TestReclaimDistinguishesFreeNeighborFromMissingMetadata(t *testing.T) {
 	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
 }
 
-func TestReclaimOrdersTombstonesAcrossMetadataHoles(t *testing.T) {
+func TestReclaimDoesNotWaitForEarlierTombstones(t *testing.T) {
 	_, cluster, manager := newReuseTestManager(t)
 	for _, id := range []uint32{42, 43, 80, 81} {
 		saveReuseTestMeta(t, manager, id, keyspacepb.KeyspaceState_TOMBSTONE)
@@ -74,7 +73,7 @@ func TestReclaimOrdersTombstonesAcrossMetadataHoles(t *testing.T) {
 	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(81).TxnRightBound)))
 	require.NoError(t, manager.RequestKeyspaceReclaim(80))
 	_, err := manager.LoadKeyspaceByID(80)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
 	// Retain 43 before the unallocated hole, but allow the next deleted group.
 	require.NoError(t, manager.RequestKeyspaceReclaim(80))
@@ -121,28 +120,29 @@ func TestClaimsPreserveRegionOrderAcrossBitmapPagesWithoutWaitingForSplits(t *te
 	require.Len(t, manager.reuse.pending, 2)
 }
 
-func TestClaimWaitsForLowerTombstoneAfterRegionsMerge(t *testing.T) {
+func TestClaimDoesNotWaitForUnreclaimedPredecessor(t *testing.T) {
 	_, cluster, manager := newReuseTestManager(t)
-	for _, id := range []uint32{43, 45} {
+	for _, id := range []uint32{100, 101, 102} {
 		saveReuseTestMeta(t, manager, id, keyspacepb.KeyspaceState_TOMBSTONE)
 	}
-	for _, id := range []uint32{42, 44} {
-		seedReuseTestBit(t, manager, id, true)
-	}
-	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(45).TxnRightBound)))
-	first, err := manager.tryCreateReusedKeyspace("first-run", nil, 1)
+	region := newReuseTestRegion(100, 420).Clone(core.WithEndKey(MakeRegionBound(102).TxnRightBound))
+	cluster.PutRegion(region)
+	// Reclaim and claim 101 without issuing any reclaim request for 100.
+	require.NoError(t, manager.RequestKeyspaceReclaim(101))
+	created, err := manager.tryCreateReusedKeyspace("skip-unreclaimed", nil, 1)
 	require.NoError(t, err)
-	require.Equal(t, uint32(42), first.GetId())
-	next, err := manager.tryCreateReusedKeyspace("second-run", nil, 1)
+	require.Equal(t, uint32(101), created.GetId())
+	old, err := manager.LoadKeyspaceByID(100)
 	require.NoError(t, err)
-	require.Nil(t, next)
-	require.NoError(t, manager.RequestKeyspaceReclaim(43))
-	next, err = manager.tryCreateReusedKeyspace("bridge", nil, 1)
+	require.Equal(t, keyspacepb.KeyspaceState_TOMBSTONE, old.State)
+	// If split isolates 100, retain it rather than delaying 101 to save it.
+	cluster.PutRegion(newReuseTestRegion(100, 420))
+	cluster.PutRegion(newReuseTestRegion(101, 421))
+	cluster.PutRegion(newReuseTestRegion(102, 422))
+	require.NoError(t, manager.RequestKeyspaceReclaim(100))
+	old, err = manager.LoadKeyspaceByID(100)
 	require.NoError(t, err)
-	require.Equal(t, uint32(43), next.GetId())
-	next, err = manager.tryCreateReusedKeyspace("second-run", nil, 1)
-	require.NoError(t, err)
-	require.Equal(t, uint32(44), next.GetId())
+	require.Equal(t, keyspacepb.KeyspaceState_TOMBSTONE, old.State)
 }
 
 type orderedReuseKV struct {
@@ -192,35 +192,6 @@ func (t *orderedReuseTxn) LoadRange(key, end string, limit int) ([]string, []str
 		t.owner.afterRange(key)
 	}
 	return keys, values, err
-}
-
-func TestClaimRevisionRejectsNewLowerBitmapBucket(t *testing.T) {
-	_, client, clean := etcdutil.NewTestEtcdCluster(t, 1, nil)
-	t.Cleanup(clean)
-	backend := &orderedReuseKV{Base: kv.NewEtcdKVBase(client)}
-	_, cluster, manager := newReuseTestManagerWithKV(t, backend)
-	cluster.PutRegion(newReuseTestRegion(42, 420).Clone(core.WithEndKey(MakeRegionBound(300).TxnRightBound)))
-	seedReuseTestBit(t, manager, 298, true)
-	injected := false
-	backend.afterLoad = func(key string) {
-		if key != keypath.KeyspaceMetaPath(298) || injected {
-			return
-		}
-		injected = true
-		// A writer changes the existing revision after the memory proof was taken.
-		require.NoError(t, backend.Base.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-			if err := manager.changeFreeBit(txn, 42, true); err != nil {
-				return err
-			}
-			return advanceFreeIDRevision(txn)
-		}))
-	}
-	created, err := manager.tryCreateReusedKeyspace("higher", nil, 1)
-	require.NoError(t, err)
-	require.True(t, injected)
-	require.Nil(t, created)
-	_, err = manager.LoadKeyspaceByID(298)
-	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
 }
 
 func TestClaimMutexCoversCommittedMetadataBeforePendingCache(t *testing.T) {
@@ -277,22 +248,6 @@ func TestClaimBoundsEtcdComparisonsAcrossLargeRegions(t *testing.T) {
 	}
 }
 
-func loadFreeIDRevision(txn kv.Txn) (uint64, error) {
-	value, err := txn.Load(freeIDRevisionPath())
-	if err != nil || value == "" {
-		return 0, err
-	}
-	return strconv.ParseUint(value, 10, 64)
-}
-
-func advanceFreeIDRevision(txn kv.Txn) error {
-	revision, err := loadFreeIDRevision(txn)
-	if err != nil {
-		return err
-	}
-	return txn.Save(freeIDRevisionPath(), strconv.FormatUint(revision+1, 10))
-}
-
 func (t *orderedReuseTxn) Load(key string) (string, error) {
 	value, err := t.Txn.Load(key)
 	if err == nil && t.owner.afterLoad != nil {
@@ -301,7 +256,7 @@ func (t *orderedReuseTxn) Load(key string) (string, error) {
 	return value, err
 }
 
-func TestClaimRejectsConcurrentCreationInMetadataHole(t *testing.T) {
+func TestClaimIgnoresUnrelatedCreationInMetadataHole(t *testing.T) {
 	_, client, clean := etcdutil.NewTestEtcdCluster(t, 1, nil)
 	t.Cleanup(clean)
 	backend := &orderedReuseKV{Base: kv.NewEtcdKVBase(client)}
@@ -315,7 +270,7 @@ func TestClaimRejectsConcurrentCreationInMetadataHole(t *testing.T) {
 			return
 		}
 		injected = true
-		// Ordinary creation now participates in the same metadata/free revision.
+		// An unrelated ordinary creation does not serialize through reuse metadata.
 		require.NoError(t, manager.saveNewKeyspace(&keyspacepb.KeyspaceMeta{
 			Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: 43}, Name: "fills-hole", State: keyspacepb.KeyspaceState_DISABLED,
 		}))
@@ -323,7 +278,5 @@ func TestClaimRejectsConcurrentCreationInMetadataHole(t *testing.T) {
 	created, err := manager.tryCreateReusedKeyspace("after-hole", nil, 1)
 	require.NoError(t, err)
 	require.True(t, injected)
-	require.Nil(t, created)
-	_, err = manager.LoadKeyspaceByID(80)
-	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound)
+	require.Equal(t, uint32(80), created.GetId())
 }

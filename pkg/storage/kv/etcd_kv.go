@@ -299,6 +299,11 @@ func (txn *etcdTxn) CompareModRevision(key string, revision int64) {
 	txn.conditions = append(txn.conditions, clientv3.Compare(clientv3.ModRevision(key), "=", revision))
 }
 
+// CompareValue adds a value condition without an extra Get.
+func (txn *etcdTxn) CompareValue(key, value string) {
+	txn.conditions = append(txn.conditions, clientv3.Compare(clientv3.Value(key), "=", value))
+}
+
 func (txn *etcdTxn) CommitRevision() int64 { return txn.revision }
 
 // commit perform the operations on etcd, with pre-condition that values observed by user have not been changed.

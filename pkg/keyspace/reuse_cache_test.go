@@ -42,6 +42,7 @@ type bitmapEtcdRecorder struct {
 	mu           sync.Mutex
 	reads        []clientv3.Op
 	comparisons  []clientv3.Cmp
+	writes       []clientv3.Op
 	transactions int
 	beforeCommit func() error
 	afterCommit  func() error
@@ -86,6 +87,9 @@ func (t *bitmapRecordedTxn) If(cmps ...clientv3.Cmp) clientv3.Txn {
 	return t
 }
 func (t *bitmapRecordedTxn) Then(ops ...clientv3.Op) clientv3.Txn {
+	t.owner.mu.Lock()
+	t.owner.writes = append(t.owner.writes, ops...)
+	t.owner.mu.Unlock()
 	for _, op := range ops {
 		if strings.HasPrefix(string(op.KeyBytes()), bitmapPrefix()) && !op.IsGet() {
 			t.mutatesBitmap = true
@@ -267,10 +271,6 @@ func TestFreeBitmapCacheLoadsBoundedEmptyIntervalsAndRestarts(t *testing.T) {
 		require.Equal(t, bitmapPath(uint32(i*2)), string(read.KeyBytes()))
 		require.Equal(t, bitmapPath(uint32(i*2+2)), string(read.RangeBytes()))
 	}
-	created, err = manager.tryCreateReusedKeyspace("loaded", nil, 2)
-	require.NoError(t, err)
-	require.Nil(t, created)
-	warmReuseTestCoverage(t, manager, id+1)
 	created, err = manager.tryCreateReusedKeyspace("loaded", nil, 2)
 	require.NoError(t, err)
 	require.Equal(t, id, created.GetId())

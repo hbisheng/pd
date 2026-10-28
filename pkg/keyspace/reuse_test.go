@@ -68,25 +68,10 @@ func warmReuseTestCoverage(t *testing.T, manager *Manager, end uint32) {
 	t.Helper()
 	manager.reuse.claimMu.Lock()
 	defer manager.reuse.claimMu.Unlock()
-	manager.reuse.mu.RLock()
-	ready := manager.reuse.revisionReady
-	manager.reuse.mu.RUnlock()
-	if !ready {
-		require.NoError(t, manager.refreshReuseRevisionLocked(manager.ctx))
-	}
 	for bucket := uint32(0); bucket <= end/uint32(manager.bitmapBytes()*8); bucket++ {
 		if _, loaded := manager.reuse.buckets[bucket]; !loaded {
 			require.NoError(t, manager.readFreeBucketIntervalLocked(manager.ctx, bucket, bucket+1))
 		}
-	}
-	manager.reuse.mu.Lock()
-	ready = manager.metadataCoverageLocked(0, end)
-	manager.reuse.mu.Unlock()
-	for !ready {
-		require.NoError(t, manager.loadReuseMetadataPageLocked(manager.ctx))
-		manager.reuse.mu.Lock()
-		ready = manager.metadataCoverageLocked(0, end)
-		manager.reuse.mu.Unlock()
 	}
 }
 
@@ -166,7 +151,7 @@ func TestReclaimWaitsForDeletedNeighborAndMultipleRegions(t *testing.T) {
 	cluster.PutRegion(covering.Clone(core.WithEndKey(MakeRegionBound(43).TxnRightBound)))
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
 	_, err = manager.LoadKeyspaceByID(42)
-	require.NoError(t, err) // Cleaner must first release the lower tombstone.
+	require.ErrorIs(t, err, errs.ErrKeyspaceNotFound) // Earlier tombstones do not delay reclamation.
 	require.NoError(t, manager.RequestKeyspaceReclaim(41))
 	require.NoError(t, manager.RequestKeyspaceReclaim(42))
 	_, err = manager.LoadKeyspaceByID(42)

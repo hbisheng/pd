@@ -551,6 +551,7 @@ func (s *Server) startServer(ctx context.Context) error {
 		s.keyspaceGroupManager,
 		s.metaServiceGroupManager,
 	)
+	s.keyspaceManager.SetReuseLeader(s.member.GetElectionPath(), s.member.MemberValue())
 	// Only start the metering writer if a valid metering config is provided.
 	if len(s.cfg.Metering.Type) > 0 {
 		s.meteringWriter, err = metering.NewWriter(s.ctx, &s.cfg.Metering, fmt.Sprintf("pd%d", s.GetMember().ID()))
@@ -1242,8 +1243,8 @@ func (s *Server) UpdateKeyspaceConfig(newCfg *config.KeyspaceConfig) {
 }
 
 func (s *Server) setKeyspaceConfigInner(oldCfg, newCfg *config.KeyspaceConfig, updateKeyspaceManager bool) error {
-	// Re-enabling a warm cache after unfenced disabled-mode writes is unsafe.
-	// Startup creates fresh coverage before any reuse can become eligible.
+	// Reuse loader startup and shutdown currently follow PD leadership.
+	// Runtime mode switching needs its own drain/start sequence.
 	if oldCfg.EnableIDReuse != newCfg.EnableIDReuse {
 		return errors.New("enable-id-reuse is startup-only; restart PD to change it")
 	}

@@ -23,12 +23,14 @@ import (
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
 
 	"github.com/tikv/pd/pkg/core"
+	"github.com/tikv/pd/pkg/utils/keypath"
 )
 
 func (r *bitmapEtcdRecorder) resetCounts() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.reads, r.comparisons, r.transactions = nil, nil, 0
+	r.writes = nil
 }
 
 func (r *bitmapEtcdRecorder) logCounts(t *testing.T, name string) {
@@ -46,7 +48,7 @@ func (r *bitmapEtcdRecorder) logCounts(t *testing.T, name string) {
 		if strings.HasPrefix(key, bitmapPrefix()) {
 			bitmap++
 		}
-		if key == freeIDRevisionPath() {
+		if key == keypath.KeyspaceFreePrefix()+"revision" {
 			revision++
 		}
 	}
@@ -78,7 +80,7 @@ func TestReuseReadOperationCounts(t *testing.T) {
 			require.Len(t, recorder.reads, 3, "only name, target and split-rule safety checks remain")
 			for _, read := range recorder.reads {
 				require.Empty(t, read.RangeBytes(), "warm Create must not discover ordering through ranges")
-				require.NotEqual(t, freeIDRevisionPath(), string(read.KeyBytes()))
+				require.NotEqual(t, keypath.KeyspaceFreePrefix()+"revision", string(read.KeyBytes()))
 				require.False(t, strings.HasPrefix(string(read.KeyBytes()), bitmapPrefix()))
 			}
 			if sample.name == "same-bucket" {
