@@ -30,7 +30,6 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/keyspace/constant"
@@ -42,16 +41,6 @@ import (
 	"github.com/tikv/pd/pkg/utils/typeutil"
 	"golang.org/x/time/rate"
 )
-
-// A split grant uses IDs already allocated by AskBatchSplit. TiKV reads the
-// keyspace configuration after receiving this grant, then reports applied children
-// through ReportBatchSplit. This evidence is deliberately not persisted: a lost
-// creation attempt is canceled rather than reconstructed from Region boundaries.
-type reuseSplitGrant struct {
-	source    *metapb.Region
-	children  map[uint64]struct{}
-	confirmed bool
-}
 
 type reuseState struct {
 	// claimMu serializes cache reads, free-bit transactions, and publication of
@@ -70,13 +59,12 @@ type reuseState struct {
 	progress       map[uint32]*keyspacepb.KeyspaceMeta
 	mu             sync.RWMutex
 	pending        map[uint32]*keyspacepb.KeyspaceMeta
-	grants         map[uint32]*reuseSplitGrant
 	watermark      uint64
 	now            func() time.Time
 }
 
 func newReuseState() *reuseState {
-	return &reuseState{pending: make(map[uint32]*keyspacepb.KeyspaceMeta), grants: make(map[uint32]*reuseSplitGrant), buckets: make(map[uint32]kv.RevisionedValue), invalidBuckets: make(map[uint32]struct{}), progress: make(map[uint32]*keyspacepb.KeyspaceMeta), now: time.Now}
+	return &reuseState{pending: make(map[uint32]*keyspacepb.KeyspaceMeta), buckets: make(map[uint32]kv.RevisionedValue), invalidBuckets: make(map[uint32]struct{}), progress: make(map[uint32]*keyspacepb.KeyspaceMeta), now: time.Now}
 }
 
 func cloneKeyspaceConfig(config map[string]string) map[string]string {
@@ -140,7 +128,6 @@ func (manager *Manager) cacheReuseMetaLocked(meta *keyspacepb.KeyspaceMeta) {
 	pending := manager.reuse.pending[meta.GetId()]
 	if meta.State != keyspacepb.KeyspaceState_DISABLED || (pending != nil && (pending.Name != meta.Name || pending.CreatedAt != meta.CreatedAt || !maps.Equal(pending.Config, meta.Config))) {
 		delete(manager.reuse.pending, meta.GetId())
-		delete(manager.reuse.grants, meta.GetId())
 	}
 	manager.keyspaceStateLookup.Store(meta.GetId(), meta.State)
 }
@@ -177,7 +164,6 @@ func (manager *Manager) StartIDReuse() error {
 	manager.reuse.progress = make(map[uint32]*keyspacepb.KeyspaceMeta)
 	manager.reuse.watermark = watermark
 	manager.reuse.pending = make(map[uint32]*keyspacepb.KeyspaceMeta)
-	manager.reuse.grants = make(map[uint32]*reuseSplitGrant)
 	manager.reuse.mu.Unlock()
 	if !manager.config.IsIDReuseEnabled() {
 		return nil
@@ -193,67 +179,8 @@ func (manager *Manager) StartIDReuse() error {
 	return nil
 }
 
-// RecordReuseSplitGrant records only grants issued while this creation is pending.
-// TiKV reads keyspace metadata after AskBatchSplit returns; older grants
-// therefore cannot initialize a newly claimed ID.
-func (manager *Manager) RecordReuseSplitGrant(source *metapb.Region, splits []*pdpb.SplitID) {
-	if source == nil || len(splits) == 0 {
-		return
-	}
-	manager.reuse.mu.Lock()
-	defer manager.reuse.mu.Unlock()
-	for id := range manager.reuse.pending {
-		bound := MakeRegionBound(id)
-		if !regionCoversKeyspace(source, bound) || regionMatchesKeyspace(source, bound) {
-			continue
-		}
-		children := make(map[uint64]struct{}, len(splits)+1)
-		children[source.GetId()] = struct{}{}
-		for _, split := range splits {
-			children[split.GetNewRegionId()] = struct{}{}
-		}
-		manager.reuse.grants[id] = &reuseSplitGrant{source: typeutil.DeepClone(source, core.RegionFactory), children: children}
-	}
-}
-
-// RecordReuseSplitResult accepts the applied split reported through the existing
-// RPC. Matching boundaries without these allocated child IDs is not completion.
-func (manager *Manager) RecordReuseSplitResult(regions []*metapb.Region) {
-	if len(regions) < 2 {
-		return
-	}
-	manager.reuse.mu.Lock()
-	defer manager.reuse.mu.Unlock()
-	for id, grant := range manager.reuse.grants {
-		if len(regions) != len(grant.children) || !bytes.Equal(regions[0].GetStartKey(), grant.source.GetStartKey()) || !bytes.Equal(regions[len(regions)-1].GetEndKey(), grant.source.GetEndKey()) {
-			continue
-		}
-		valid, exact := true, false
-		seen := make(map[uint64]struct{}, len(regions))
-		for index, region := range regions {
-			_, known := grant.children[region.GetId()]
-			_, duplicate := seen[region.GetId()]
-			if !known || duplicate || region.GetRegionEpoch().GetVersion() != grant.source.GetRegionEpoch().GetVersion()+uint64(len(regions)-1) || region.GetRegionEpoch().GetConfVer() != grant.source.GetRegionEpoch().GetConfVer() || (index > 0 && !bytes.Equal(regions[index-1].GetEndKey(), region.GetStartKey())) {
-				valid = false
-				break
-			}
-			seen[region.GetId()] = struct{}{}
-			if regionMatchesKeyspace(region, MakeRegionBound(id)) {
-				exact = true
-			}
-		}
-		if valid && exact {
-			grant.confirmed = true
-		}
-	}
-}
-
 func regionCoversKeyspace(region *metapb.Region, bound *RegionBound) bool {
 	return bytes.Compare(region.GetStartKey(), bound.TxnLeftBound) <= 0 && (len(region.GetEndKey()) == 0 || bytes.Compare(region.GetEndKey(), bound.TxnRightBound) >= 0)
-}
-
-func regionMatchesKeyspace(region *metapb.Region, bound *RegionBound) bool {
-	return bytes.Equal(region.GetStartKey(), bound.TxnLeftBound) && bytes.Equal(region.GetEndKey(), bound.TxnRightBound)
 }
 
 func (manager *Manager) rejectIndependentScheduling() error {
@@ -296,14 +223,6 @@ func (manager *Manager) coveringKeyspaceRegion(id uint32) *core.RegionInfo {
 		return nil
 	}
 	return region
-}
-func (manager *Manager) exactKeyspaceRegion(id uint32) (*core.RegionInfo, error) {
-	region := manager.coveringKeyspaceRegion(id)
-	bound := MakeRegionBound(id)
-	if region == nil || !bytes.Equal(region.GetStartKey(), bound.TxnLeftBound) || !bytes.Equal(region.GetEndKey(), bound.TxnRightBound) {
-		return nil, errors.Errorf("keyspace %d does not have one complete Region", id)
-	}
-	return region, nil
 }
 
 // splittableKeyspaceRegion requires at least one missing keyspace boundary.
@@ -397,29 +316,13 @@ func (manager *Manager) tryCompleteReusedCreate(expected *keyspacepb.KeyspaceMet
 	if !manager.config.IsIDReuseEnabled() {
 		return errors.New("keyspace ID reuse is disabled")
 	}
-	region, err := manager.exactKeyspaceRegion(expected.GetId())
-	if err != nil {
+	// Ordered claims persist configuration before installing split rules. Use the
+	// same boundary check as normal Create, including splits shared by neighbors.
+	if !manager.hasKeyspaceRegionBound(expected.GetId(), txnRegionBound) {
 		return nil
 	}
 	if err := manager.reuseAdmissionReady(); err != nil {
 		return err
-	}
-	manager.reuse.mu.RLock()
-	grant := manager.reuse.grants[expected.GetId()]
-	confirmed := grant != nil && grant.confirmed
-	belongs := false
-	if grant != nil {
-		_, belongs = grant.children[region.GetID()]
-		belongs = belongs && region.GetRegionEpoch().GetVersion() == grant.source.GetRegionEpoch().GetVersion()+uint64(len(grant.children)-1)
-	}
-	manager.reuse.mu.RUnlock()
-	if !belongs {
-		return errors.New("reused keyspace no longer requires this creation's split")
-	}
-	// Heartbeat may arrive before ReportBatchSplit. Wait for that applied result,
-	// but never treat an exact range alone as successful initialization.
-	if !confirmed {
-		return nil
 	}
 	return manager.completeReusedCreate(expected)
 }
@@ -629,7 +532,6 @@ func (manager *Manager) releaseReclaimedID(expected *keyspacepb.KeyspaceMeta) er
 		}
 		manager.reuse.mu.Lock()
 		delete(manager.reuse.pending, expected.GetId())
-		delete(manager.reuse.grants, expected.GetId())
 		manager.reuse.mu.Unlock()
 		manager.keyspaceNameLookup.Delete(expected.GetId())
 		manager.keyspaceStateLookup.Delete(expected.GetId())

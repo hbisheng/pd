@@ -1825,8 +1825,6 @@ func (s *GrpcServer) AskBatchSplit(ctx context.Context, request *pdpb.AskBatchSp
 		}, nil
 	}
 
-	s.GetKeyspaceManager().RecordReuseSplitGrant(request.GetRegion(), split.GetIds())
-
 	return &pdpb.AskBatchSplitResponse{
 		Header: grpcutil.WrapHeader(),
 		Ids:    split.Ids,
@@ -1896,8 +1894,6 @@ func (s *GrpcServer) ReportBatchSplit(ctx context.Context, request *pdpb.ReportB
 				err.Error()),
 		}, nil
 	}
-
-	s.GetKeyspaceManager().RecordReuseSplitResult(request.GetRegions())
 
 	return &pdpb.ReportBatchSplitResponse{
 		Header: grpcutil.WrapHeader(),
