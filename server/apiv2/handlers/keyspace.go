@@ -46,6 +46,7 @@ func RegisterKeyspace(r *gin.RouterGroup) {
 	router.PATCH("/:name/config", UpdateKeyspaceConfig)
 	router.PUT("/:name/state", UpdateKeyspaceState)
 	router.GET("/id/:id", LoadKeyspaceByID)
+	router.POST("/id/:id/reclaim", ReclaimKeyspace)
 }
 
 // CreateKeyspaceParams represents parameters needed when creating a new keyspace.
@@ -495,4 +496,34 @@ func (meta *KeyspaceMeta) UnmarshalJSON(data []byte) error {
 	}
 	meta.KeyspaceMeta = pbMeta
 	return nil
+}
+
+// ReclaimKeyspace reclaims an eligible TOMBSTONE keyspace ID.
+//
+// @Tags keyspaces
+// @Summary Reclaim an eligible tombstoned keyspace ID.
+// @Param id path int true "Keyspace ID"
+// @Produce json
+// @Success 200 {object} map[string]bool
+// @Failure 400 {string} string "Invalid keyspace ID."
+// @Failure 503 {string} string "Reclamation unavailable or failed."
+// @Router /keyspaces/id/{id}/reclaim [post]
+func ReclaimKeyspace(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 24)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, err.Error())
+		return
+	}
+	svr := c.MustGet(middlewares.ServerContextKey).(*server.Server)
+	manager := svr.GetKeyspaceManager()
+	if manager == nil {
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, managerUninitializedErr)
+		return
+	}
+	reclaimed, err := manager.RequestKeyspaceReclaim(c.Request.Context(), uint32(id))
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"reclaimed": reclaimed})
 }

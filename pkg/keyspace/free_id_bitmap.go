@@ -182,6 +182,10 @@ func (b *freeIDBitmap) loadRangeLocked(ctx context.Context, start, end uint32) e
 func (b *freeIDBitmap) firstFree(start, end uint32) (uint32, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.firstFreeLocked(start, end)
+}
+
+func (b *freeIDBitmap) firstFreeLocked(start, end uint32) (uint32, bool) {
 	if start >= end || end > constant.MaxValidKeyspaceID+1 {
 		return 0, false
 	}
@@ -216,6 +220,10 @@ func (b *freeIDBitmap) firstFree(start, end uint32) (uint32, bool) {
 func (b *freeIDBitmap) update(ctx context.Context, id uint32, free bool, metadata func(kv.Txn) error) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.updateLocked(ctx, id, free, metadata)
+}
+
+func (b *freeIDBitmap) updateLocked(ctx context.Context, id uint32, free bool, metadata func(kv.Txn) error) error {
 	if !b.initialized || id > constant.MaxValidKeyspaceID {
 		return errors.New("free ID bitmap is not initialized or ID is out of range")
 	}
