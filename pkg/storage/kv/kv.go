@@ -138,6 +138,14 @@ type RevisionTxn interface {
 	LoadWithRevision(key string) (string, error)
 }
 
+// CommittedRevisionTxn exposes the revision of a successfully committed transaction.
+// CommitRevision is available only after the enclosing transaction runner returns
+// nil. Callers can use it to update cached values without another storage read.
+type CommittedRevisionTxn interface {
+	Txn
+	CommitRevision() int64
+}
+
 // ConditionalTxnRunner runs a transaction with additional etcd comparisons.
 // The comparisons and the transaction operations are committed atomically.
 type ConditionalTxnRunner interface {
