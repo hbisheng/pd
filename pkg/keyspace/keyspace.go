@@ -114,6 +114,8 @@ type Manager struct {
 	keyspaceStateLookup  sync.Map // store as ID(uint32) -> state(keyspacepb.KeyspaceState)
 	cache                *Cache
 	gcBarrierInvalidator atomic.Pointer[func(uint32)]
+	reuse                atomic.Pointer[idReuse]
+	reuseLifecycleMu     sync.Mutex
 }
 
 // SetGCBarrierInvalidator installs the GC observation lifecycle callback.
@@ -250,7 +252,7 @@ func (manager *Manager) initReserveKeyspace(id uint32, name string) error {
 		config[GCManagementType] = KeyspaceLevelGC
 	}
 	meta.Config = config
-	err = manager.saveNewKeyspace(meta)
+	err = manager.saveNewKeyspace(meta, false)
 	// It's possible that default/system keyspace already exists in the storage (e.g. PD restart/recover),
 	// so we ignore the keyspaceExists error.
 	if err != nil && err != errs.ErrKeyspaceExists {
@@ -345,7 +347,7 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 	// Assign a meta-service group (if any exist) and save the keyspace atomically
 	// with respect to group deletion. The assignment is reflected in request.Config.
 	assignToMetaServiceGroup := manager.mgm != nil && len(manager.mgm.GetGroups()) > 0
-	if err = manager.assignGroupAndSaveKeyspace(assignToMetaServiceGroup, &request.Config, keyspace); err != nil {
+	if err = manager.assignGroupAndSaveKeyspace(assignToMetaServiceGroup, &request.Config, keyspace, false); err != nil {
 		log.Warn("[create-keyspace] failed to save keyspace before split",
 			zap.Uint32("keyspace-id", keyspace.GetId()),
 			zap.String("keyspace-name", keyspace.GetName()),
@@ -492,7 +494,7 @@ func (manager *Manager) CreateKeyspaceByID(request *CreateKeyspaceByIDRequest) (
 	// Assign a meta-service group (if any exist) and save the keyspace atomically
 	// with respect to group deletion. The assignment is reflected in request.Config.
 	assignToMetaServiceGroup := manager.mgm != nil && len(manager.mgm.GetGroups()) > 0
-	if err = manager.assignGroupAndSaveKeyspace(assignToMetaServiceGroup, &request.Config, keyspace); err != nil {
+	if err = manager.assignGroupAndSaveKeyspace(assignToMetaServiceGroup, &request.Config, keyspace, true); err != nil {
 		log.Warn("[keyspace] failed to save keyspace before split",
 			zap.Uint32("keyspace-id", keyspace.GetId()),
 			zap.String("keyspace-name", keyspace.GetName()),
@@ -551,11 +553,17 @@ func (manager *Manager) CreateKeyspaceByID(request *CreateKeyspaceByIDRequest) (
 	return keyspace, nil
 }
 
-func (manager *Manager) saveNewKeyspace(keyspace *keyspacepb.KeyspaceMeta) error {
+func (manager *Manager) saveNewKeyspace(keyspace *keyspacepb.KeyspaceMeta, explicitID bool) error {
 	manager.metaLock.Lock(keyspace.GetId())
 	defer manager.metaLock.Unlock(keyspace.GetId())
 
 	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
+		// Allocator-issued IDs are fresh; only caller-supplied IDs can be free.
+		if explicitID {
+			if err := manager.rejectFreeID(txn, keyspace.GetId()); err != nil {
+				return err
+			}
+		}
 		// Save keyspace ID.
 		// Check if keyspace with that name already exists.
 		nameExists, _, err := manager.store.LoadKeyspaceID(txn, keyspace.Name)
@@ -612,9 +620,9 @@ func (manager *Manager) rollbackMetaServiceGroupAssignment(groupID string) {
 // window between assignment and the keyspace being saved, which would otherwise
 // leave the keyspace referencing a non-existent group. config must point to
 // request.Config so the assigned group ID is visible to later create steps.
-func (manager *Manager) assignGroupAndSaveKeyspace(assign bool, config *map[string]string, keyspace *keyspacepb.KeyspaceMeta) error {
+func (manager *Manager) assignGroupAndSaveKeyspace(assign bool, config *map[string]string, keyspace *keyspacepb.KeyspaceMeta, explicitID bool) error {
 	if !assign {
-		return manager.saveNewKeyspace(keyspace)
+		return manager.saveNewKeyspace(keyspace, explicitID)
 	}
 	manager.mgm.RLock()
 	defer manager.mgm.RUnlock()
@@ -622,7 +630,7 @@ func (manager *Manager) assignGroupAndSaveKeyspace(assign bool, config *map[stri
 	// PATCH deleted the last group in the meantime. In that case create the
 	// keyspace without a meta-service group instead of failing the creation.
 	if !manager.mgm.hasGroupsLocked() {
-		return manager.saveNewKeyspace(keyspace)
+		return manager.saveNewKeyspace(keyspace, explicitID)
 	}
 	groupID, err := manager.mgm.pickGroupLocked(manager.ctx)
 	if err != nil {
@@ -630,7 +638,7 @@ func (manager *Manager) assignGroupAndSaveKeyspace(assign bool, config *map[stri
 			// Groups exist but none are enabled: create the keyspace without a
 			// meta-service group assignment instead of failing the creation, the
 			// same way a concurrently-emptied group set is tolerated above.
-			return manager.saveNewKeyspace(keyspace)
+			return manager.saveNewKeyspace(keyspace, explicitID)
 		}
 		return err
 	}
@@ -639,7 +647,7 @@ func (manager *Manager) assignGroupAndSaveKeyspace(assign bool, config *map[stri
 	}
 	(*config)[MetaServiceGroupIDKey] = groupID
 	keyspace.Config = *config
-	if err := manager.saveNewKeyspace(keyspace); err != nil {
+	if err := manager.saveNewKeyspace(keyspace, explicitID); err != nil {
 		// Roll back the reservation made by pickGroupLocked. This only performs
 		// store operations and does not take the mgm lock, so it is safe to call
 		// while still holding the read lock.

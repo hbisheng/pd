@@ -848,7 +848,7 @@ func (suite *keyspaceTestSuite) TestPatrolKeyspaceAssignment() {
 		State:          keyspacepb.KeyspaceState_ENABLED,
 		CreatedAt:      now,
 		StateChangedAt: now,
-	})
+	}, false)
 	re.NoError(err)
 	// Check if the keyspace is not attached to the default group.
 	defaultKeyspaceGroup, err := suite.manager.kgm.GetKeyspaceGroupByID(constant.DefaultKeyspaceGroupID)
@@ -876,7 +876,7 @@ func (suite *keyspaceTestSuite) TestPatrolKeyspaceAssignmentInBatch() {
 			State:          keyspacepb.KeyspaceState_ENABLED,
 			CreatedAt:      now,
 			StateChangedAt: now,
-		})
+		}, false)
 		re.NoError(err)
 	}
 	// Check if all the keyspaces are not attached to the default group.
@@ -909,7 +909,7 @@ func (suite *keyspaceTestSuite) TestPatrolKeyspaceAssignmentWithRange() {
 			State:          keyspacepb.KeyspaceState_ENABLED,
 			CreatedAt:      now,
 			StateChangedAt: now,
-		})
+		}, false)
 		re.NoError(err)
 	}
 	// Check if all the keyspaces are not attached to the default group.
@@ -1069,7 +1069,7 @@ func benchmarkPatrolKeyspaceAssignmentN(
 			State:          keyspacepb.KeyspaceState_ENABLED,
 			CreatedAt:      now,
 			StateChangedAt: now,
-		})
+		}, false)
 		re.NoError(err)
 	}
 	// Benchmark the keyspace assignment patrol.
@@ -1092,7 +1092,7 @@ func (suite *keyspaceTestSuite) TestChecker() {
 		CreatedAt:      time.Now().Unix(),
 		StateChangedAt: time.Now().Unix(),
 	}
-	re.NoError(suite.manager.saveNewKeyspace(meta))
+	re.NoError(suite.manager.saveNewKeyspace(meta, false))
 
 	meta = &keyspacepb.KeyspaceMeta{
 		Keyspace:       &keyspacepb.KeyspaceMeta_Id{Id: 10001},
@@ -1101,7 +1101,7 @@ func (suite *keyspaceTestSuite) TestChecker() {
 		CreatedAt:      time.Now().Unix(),
 		StateChangedAt: time.Now().Unix(),
 	}
-	re.NoError(suite.manager.saveNewKeyspace(meta))
+	re.NoError(suite.manager.saveNewKeyspace(meta, false))
 
 	// keyspace exist check.
 	re.True(suite.manager.KeyspaceExist(10000))
@@ -1121,7 +1121,7 @@ func (suite *keyspaceTestSuite) TestGCBarrierRemovalInvalidationAfterCommit() {
 	re := suite.Require()
 	m := suite.manager
 	meta := &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: 20000}, Name: "barrier-remove", State: keyspacepb.KeyspaceState_TOMBSTONE}
-	re.NoError(m.saveNewKeyspace(meta))
+	re.NoError(m.saveNewKeyspace(meta, false))
 	re.NoError(m.kgm.CreateKeyspaceGroups([]*endpoint.KeyspaceGroup{{ID: 101, UserKind: endpoint.Standard.String(), Keyspaces: []uint32{20000}}}))
 	calls := 0
 	m.SetGCBarrierInvalidator(func(id uint32) {
@@ -1158,7 +1158,7 @@ func (suite *keyspaceTestSuite) TestRemoveKeyspaceCleansCache() {
 		CreatedAt:      time.Now().Unix(),
 		StateChangedAt: time.Now().Unix(),
 	}
-	re.NoError(suite.manager.saveNewKeyspace(meta))
+	re.NoError(suite.manager.saveNewKeyspace(meta, false))
 	_, found := suite.manager.cache.getKeyspaceByID(meta.GetId())
 	re.True(found)
 
@@ -1184,7 +1184,7 @@ func TestAssignGroupAndSaveKeyspace(t *testing.T) {
 	managerNoGroup := NewKeyspaceManager(ctx, store, nil, mockid.NewIDAllocator(), &mockConfig{}, kgm, emptyMgm)
 	cfg := map[string]string{}
 	ks := &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: 100}, Name: "ks-stale-precheck", Config: cfg}
-	re.NoError(managerNoGroup.assignGroupAndSaveKeyspace(true, &cfg, ks))
+	re.NoError(managerNoGroup.assignGroupAndSaveKeyspace(true, &cfg, ks, false))
 	re.NotContains(ks.GetConfig(), MetaServiceGroupIDKey)
 	loaded, err := managerNoGroup.LoadKeyspace("ks-stale-precheck")
 	re.NoError(err)
@@ -1198,7 +1198,7 @@ func TestAssignGroupAndSaveKeyspace(t *testing.T) {
 	managerWithGroup := NewKeyspaceManager(ctx, store, nil, mockid.NewIDAllocator(), &mockConfig{}, kgm, mgm)
 	cfg2 := map[string]string{}
 	ks2 := &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: 101}, Name: "ks-with-group", Config: cfg2}
-	re.NoError(managerWithGroup.assignGroupAndSaveKeyspace(true, &cfg2, ks2))
+	re.NoError(managerWithGroup.assignGroupAndSaveKeyspace(true, &cfg2, ks2, false))
 	re.Equal("g1", ks2.GetConfig()[MetaServiceGroupIDKey])
 
 	// A group that exists but is disabled must not fail creation: the keyspace is
@@ -1207,7 +1207,7 @@ func TestAssignGroupAndSaveKeyspace(t *testing.T) {
 	managerDisabled := NewKeyspaceManager(ctx, store, nil, mockid.NewIDAllocator(), &mockConfig{}, kgm, disabledMgm)
 	cfg3 := map[string]string{}
 	ks3 := &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: 102}, Name: "ks-disabled-group", Config: cfg3}
-	re.NoError(managerDisabled.assignGroupAndSaveKeyspace(true, &cfg3, ks3))
+	re.NoError(managerDisabled.assignGroupAndSaveKeyspace(true, &cfg3, ks3, false))
 	re.NotContains(ks3.GetConfig(), MetaServiceGroupIDKey)
 }
 

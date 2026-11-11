@@ -71,6 +71,13 @@ type allocatorImpl struct {
 	effectiveEnd uint64
 }
 
+// GetReservedWindowEnd returns the durable upper end of the reserved ID window.
+func (alloc *allocatorImpl) GetReservedWindowEnd() uint64 {
+	alloc.mu.RLock()
+	defer alloc.mu.RUnlock()
+	return alloc.end
+}
+
 // metrics is a collection of idAllocator's metrics.
 type metrics struct {
 	idGauge prometheus.Gauge
