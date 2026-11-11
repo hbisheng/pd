@@ -41,10 +41,21 @@ type freeIDBitmapStore interface {
 	kv.ConditionalTxnRunner
 }
 
-// freeIDBitmap is a leader-local cache. Construct a new instance for each
-// leadership term and cancel and join runLoader before dropping it. All bucket
-// writers in that term must use update; CAS rejects stale cached revisions.
-// Construction has no storage or goroutine side effects.
+// freeIDBitmap stores reclaimed keyspace IDs for future reuse. Each bit
+// represents one ID: 1 means free, and 0 means unavailable. Consecutive IDs
+// share a bucket; a 64-byte bucket covers 512 IDs. Only IDs whose reclamation
+// has completed belong in this index.
+//
+// Buckets are persisted in etcd and loaded gradually into an in-memory cache.
+// Reclamation sets an ID's bit; claiming it for a new keyspace clears the bit.
+// update commits the bit change and the caller's keyspace metadata changes in
+// one etcd transaction. Candidate lookup uses only the cache; updates compare
+// the cached ModRevision and publish the new cached value after commit.
+//
+// Callers decide which IDs are eligible for reclamation or reuse and when to
+// run the loader. Construct a new instance for each leadership term, route all
+// bucket writes through update, and cancel and join runLoader before dropping
+// the instance. Construction has no storage or goroutine side effects.
 type freeIDBitmap struct {
 	mu          sync.Mutex
 	store       freeIDBitmapStore
@@ -57,6 +68,15 @@ type freeIDBitmap struct {
 	nextLoad    uint32
 }
 
+// newFreeIDBitmap creates an empty cache. prefix is the caller-provided etcd
+// directory, including its trailing slash. With 64-byte buckets, storage is:
+//
+//	<prefix>layout           -> "v1:64"
+//	<prefix>buckets/00000000 -> bitmap for IDs 0-511
+//	<prefix>buckets/00000001 -> bitmap for IDs 512-1023
+//
+// Empty buckets are deleted from etcd. A bucket absent from the local cache
+// is still unknown until loaded; it must not be treated as having no free IDs.
 func newFreeIDBitmap(store freeIDBitmapStore, prefix string, bucketBytes int) (*freeIDBitmap, error) {
 	if prefix == "" || !strings.HasSuffix(prefix, "/") {
 		return nil, errors.New("free ID bitmap prefix must end with a slash")
@@ -78,8 +98,10 @@ func (b *freeIDBitmap) bucketKey(bucket uint32) string {
 	return fmt.Sprintf("%sbuckets/%08d", b.prefix, bucket)
 }
 
-// initialize pins the bucket size on disk. Resizing an existing bitmap requires
-// a migration; interpreting its bits using a different width is unsafe.
+// initialize creates or checks the single layout record for this bitmap.
+// "v1:<bucketBytes>" records the storage format version and bucket width, so
+// restarts interpret each bit as the same ID. Existing layouts must match
+// exactly; changing the version or width requires a separate migration.
 func (b *freeIDBitmap) initialize(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
