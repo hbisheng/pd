@@ -222,3 +222,16 @@
 ## Example:
 ## pre-alloc = ["admin", "user1", "user2"]
 # pre-alloc = []
+
+## Deleted keyspace ID reuse is experimental and disabled by default.
+## These settings are read from the startup configuration; changing them requires
+## a PD restart. Enable only with TiKV merge/split metadata cleanup deployed.
+# enable-id-reuse = false
+## Begin reclaiming and reusing after the allocator reserves this many IDs.
+# id-reuse-threshold = 1000000
+## Bucket width is persisted and cannot be changed after first use.
+# id-reuse-bucket-bytes = 64
+## Load at most this many numeric bucket slots per background read.
+# id-reuse-load-page-buckets = 64
+# id-reuse-load-interval = "100ms"
+# id-reuse-reclaim-interval = "10ms"
