@@ -15,7 +15,6 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -39,8 +38,7 @@ func TestKeyspaceReclaimAPI(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, failpoint.Disable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion")) })
 	for _, enabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			ctx := t.Context()
 			cluster, err := tests.NewTestCluster(ctx, 1, func(cfg *config.Config, _ string) {
 				cfg.Keyspace.EnableIDReuse = enabled
 				cfg.Keyspace.IDReuseThreshold = 1
