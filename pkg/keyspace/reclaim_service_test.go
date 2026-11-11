@@ -15,6 +15,8 @@
 package keyspace
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,4 +124,49 @@ func TestReclaimServiceRejectsOldLeader(t *testing.T) {
 	reclaimed, err = m.RequestKeyspaceReclaim(m.ctx, 42)
 	require.NoError(t, err)
 	require.True(t, reclaimed)
+}
+
+// Track bucket reads in the metadata transaction independently of the loader.
+type freeIDReadStore struct {
+	kv.Base
+	reads int
+}
+
+type freeIDReadTxn struct {
+	kv.Txn
+	store *freeIDReadStore
+}
+
+func (s *freeIDReadStore) RunInTxn(ctx context.Context, f func(kv.Txn) error) error {
+	return s.Base.RunInTxn(ctx, func(txn kv.Txn) error { return f(&freeIDReadTxn{Txn: txn, store: s}) })
+}
+
+func (txn *freeIDReadTxn) Load(key string) (string, error) {
+	if strings.HasPrefix(key, keyspaceFreePrefix()+"buckets/") {
+		txn.store.reads++
+	}
+	return txn.Txn.Load(key)
+}
+
+func TestReclaimServiceChecksFreeBitsOnlyForExplicitIDs(t *testing.T) {
+	m, cluster, backend := newReclaimServiceFixture(t)
+	reclaimForReuse(t, m, cluster)
+	// Keep this Create on the increasing allocator, including with reuse integrated.
+	m.reuse.Load().threshold = 1000
+	counted := &freeIDReadStore{Base: backend}
+	m.store.(*endpoint.StorageEndpoint).Base = counted
+	require.NoError(t, failpoint.Enable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion", "return(true)"))
+	t.Cleanup(func() { require.NoError(t, failpoint.Disable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion")) })
+	meta, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: "fresh", CreateTime: 10})
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), meta.GetId())
+	require.Zero(t, counted.reads, "fresh allocation must not read the free bitmap")
+
+	id := uint32(42)
+	_, err = m.CreateKeyspaceByID(&CreateKeyspaceByIDRequest{ID: &id, Name: "bypass", CreateTime: 10})
+	require.ErrorContains(t, err, "free keyspace IDs must be claimed")
+	require.Equal(t, 1, counted.reads)
+	current, _, err := endpoint.NewStorageEndpoint(backend, nil).LoadKeyspaceMetaWithRevision(m.ctx, id)
+	require.NoError(t, err)
+	require.Nil(t, current)
 }
