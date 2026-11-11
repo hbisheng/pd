@@ -65,7 +65,7 @@ type freeIDBitmap struct {
 	buckets     map[uint32]kv.KeyValuePair // Includes loaded, absent buckets.
 	freeBuckets []uint32                   // Sorted, nonempty buckets only.
 	invalid     map[uint32]struct{}
-	nextLoad    uint32
+	nextLoad    uint32 // Buckets below this position are known, including absent ones.
 }
 
 // newFreeIDBitmap creates an empty cache. prefix is the caller-provided etcd
@@ -156,6 +156,27 @@ func (b *freeIDBitmap) loadNextPage(ctx context.Context, pageBuckets uint32) err
 	for bucket := range b.invalid {
 		return b.loadRangeLocked(ctx, bucket, bucket+1)
 	}
+	// A fresh empty index needs one existence query, not a scan of every page.
+	// The lock excludes local writes; subsequent updates maintain this cache.
+	if b.nextLoad == 0 {
+		resp, err := b.store.CreateRawTxnWithContext(ctx).Then(kv.RawTxnOp{
+			Key: b.bucketKey(0), EndKey: b.bucketKey(b.bucketCount()),
+			OpType: kv.RawTxnOpGetRange, Limit: 1,
+		}).Commit()
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(resp.Responses) != 1 {
+			return errors.New("invalid free ID bitmap range response")
+		}
+		if len(resp.Responses[0].KeyValuePairs) == 0 {
+			b.nextLoad = b.bucketCount()
+			return nil
+		}
+	}
 	start := b.nextLoad
 	end := start + min(pageBuckets, b.bucketCount()-start)
 	if start == end {
@@ -219,7 +240,10 @@ func (b *freeIDBitmap) firstFreeLocked(start, end uint32) (uint32, bool) {
 			break
 		}
 		for ; checked <= bucket; checked++ {
-			if _, loaded := b.buckets[checked]; !loaded {
+			if _, invalid := b.invalid[checked]; invalid {
+				return 0, false
+			}
+			if _, loaded := b.buckets[checked]; !loaded && checked >= b.nextLoad {
 				return 0, false
 			}
 		}
@@ -251,6 +275,11 @@ func (b *freeIDBitmap) updateLocked(ctx context.Context, id uint32, free bool, m
 	}
 	bucket := id / uint32(b.bucketBytes*8)
 	value, loaded := b.buckets[bucket]
+	if !loaded && bucket < b.nextLoad {
+		_, invalid := b.invalid[bucket]
+		loaded = !invalid
+		value.Key = b.bucketKey(bucket)
+	}
 	if !loaded {
 		if err := b.loadRangeLocked(ctx, bucket, bucket+1); err != nil {
 			return err
