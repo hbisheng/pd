@@ -140,6 +140,33 @@ func TestFreeIDBitmap(t *testing.T) {
 		require.Equal(t, reads, store.reads)
 	})
 
+	t.Run("empty index skips pages and accepts later updates", func(t *testing.T) {
+		b, store := newBitmap(t)
+		reads := store.reads
+		require.NoError(t, b.loadNextPage(ctx, 64))
+		require.Equal(t, reads+1, store.reads)
+		require.Equal(t, 1, store.lastRead[0].Limit)
+		require.Equal(t, b.bucketCount(), b.nextLoad)
+		require.Empty(t, b.buckets, "known-empty buckets need no cache entries")
+		require.NoError(t, b.loadNextPage(ctx, 64))
+		require.NoError(t, b.update(ctx, 512, true, noMetadata))
+		require.Equal(t, reads+1, store.reads, "empty pages and later writes need no extra reads")
+		id, ok := b.firstFree(0, 1024)
+		require.True(t, ok)
+		require.Equal(t, uint32(512), id)
+
+		// A failed write still invalidates a bucket inside the known prefix.
+		store.loseReply = true
+		require.Error(t, b.update(ctx, 511, true, noMetadata))
+		_, ok = b.firstFree(0, 1024)
+		require.False(t, ok)
+		store.loseReply = false
+		require.NoError(t, b.loadNextPage(ctx, 64))
+		id, ok = b.firstFree(0, 1024)
+		require.True(t, ok)
+		require.Equal(t, uint32(511), id)
+	})
+
 	t.Run("unknown earlier bucket blocks selection", func(t *testing.T) {
 		b, _ := newBitmap(t)
 		require.NoError(t, b.update(ctx, 512, true, noMetadata))
