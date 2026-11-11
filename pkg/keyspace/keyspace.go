@@ -278,6 +278,12 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 	if err := validateName(request.Name); err != nil {
 		return nil, err
 	}
+	if r := manager.reuse.Load(); r != nil {
+		meta, err := manager.createReusedKeyspace(r, request, tracer)
+		if err != nil || meta != nil {
+			return meta, err
+		}
+	}
 	// Check if keyspace with that name already exists before allocating ID.
 	// This prevents unnecessary ID allocation when the name already exists.
 	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {

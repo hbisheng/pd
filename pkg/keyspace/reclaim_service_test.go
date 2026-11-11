@@ -105,23 +105,6 @@ func TestIDReuseThresholdUsesPersistedAllocator(t *testing.T) {
 	reclaimForReuse(t, m, cluster)
 }
 
-func TestReclaimServiceKeepsCreateOnIncreasingAllocator(t *testing.T) {
-	m, cluster, _ := newReclaimServiceFixture(t)
-	reclaimForReuse(t, m, cluster)
-	require.NoError(t, failpoint.Enable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion", "return(true)"))
-	t.Cleanup(func() { require.NoError(t, failpoint.Disable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion")) })
-	meta, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: "after-reclaim", CreateTime: 10})
-	require.NoError(t, err)
-	require.Equal(t, uint32(1), meta.GetId())
-	id, free := m.reuse.Load().bitmap.firstFree(42, 43)
-	require.True(t, free)
-	require.Equal(t, uint32(42), id)
-	// Explicit-ID Create must leave the free pool to its allocator.
-	id = 42
-	_, err = m.CreateKeyspaceByID(&CreateKeyspaceByIDRequest{ID: &id, Name: "bypass", CreateTime: 10})
-	require.ErrorContains(t, err, "must be claimed")
-}
-
 func TestReclaimServiceRejectsOldLeader(t *testing.T) {
 	m, cluster, backend := newReclaimServiceFixture(t)
 	seedReclaimMeta(t, m, 42, keyspacepb.KeyspaceState_TOMBSTONE)

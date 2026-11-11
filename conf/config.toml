@@ -227,6 +227,8 @@
 ## These settings are read from the startup configuration; changing them requires
 ## a PD restart. Enable only with TiKV merge/split metadata cleanup deployed.
 # enable-id-reuse = false
+## Allow legacy-encrypted keyspaces to reuse IDs. CMEK is excluded.
+# enable-encrypted-id-reuse = false
 ## Begin reclaiming and reusing after the allocator reserves this many IDs.
 # id-reuse-threshold = 1000000
 ## Bucket width is persisted and cannot be changed after first use.

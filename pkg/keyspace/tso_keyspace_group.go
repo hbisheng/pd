@@ -1441,41 +1441,51 @@ func (m *GroupManager) updateKeyspaceForGroupLocked(userKind endpoint.UserKind, 
 	var kg *endpoint.KeyspaceGroup
 	if err := m.store.RunInTxn(m.ctx, func(txn kv.Txn) error {
 		var err error
-		kg, err = m.store.LoadKeyspaceGroup(txn, uint32(groupID))
-		if err != nil {
-			return err
-		}
-		if kg == nil || endpoint.StringUserKind(kg.UserKind) != userKind {
-			return errs.ErrKeyspaceGroupNotExists.FastGenByArgs(uint32(groupID))
-		}
-		if kg.IsSplitting() {
-			return errs.ErrKeyspaceGroupInSplit.FastGenByArgs(uint32(groupID))
-		}
-		if kg.IsMerging() {
-			return errs.ErrKeyspaceGroupInMerging.FastGenByArgs(uint32(groupID))
-		}
-
-		changed := false
-		switch mutation {
-		case opAdd:
-			if !slices.Contains(kg.Keyspaces, keyspaceID) {
-				kg.Keyspaces = append(kg.Keyspaces, keyspaceID)
-				changed = true
-			}
-		case opDelete:
-			lenOfKeyspaces := len(kg.Keyspaces)
-			kg.Keyspaces = slice.Remove(kg.Keyspaces, keyspaceID)
-			changed = lenOfKeyspaces != len(kg.Keyspaces)
-		}
-		if !changed {
-			return nil
-		}
-		return m.store.SaveKeyspaceGroup(txn, kg)
+		kg, err = m.updateKeyspaceForGroupTxn(txn, userKind, groupID, keyspaceID, mutation)
+		return err
 	}); err != nil {
 		return err
 	}
 	m.putKeyspaceGroupToCacheLocked(kg)
 	return nil
+}
+
+// updateKeyspaceForGroupTxn stages membership changes in the caller's transaction.
+// The caller holds m.Lock and publishes kg to the cache only after commit.
+func (m *GroupManager) updateKeyspaceForGroupTxn(txn kv.Txn, userKind endpoint.UserKind, groupID uint64, keyspaceID uint32, mutation int) (*endpoint.KeyspaceGroup, error) {
+	kg, err := m.store.LoadKeyspaceGroup(txn, uint32(groupID))
+	if err != nil {
+		return nil, err
+	}
+	if kg == nil || endpoint.StringUserKind(kg.UserKind) != userKind {
+		return nil, errs.ErrKeyspaceGroupNotExists.FastGenByArgs(uint32(groupID))
+	}
+	if kg.IsSplitting() {
+		return nil, errs.ErrKeyspaceGroupInSplit.FastGenByArgs(uint32(groupID))
+	}
+	if kg.IsMerging() {
+		return nil, errs.ErrKeyspaceGroupInMerging.FastGenByArgs(uint32(groupID))
+	}
+
+	changed := false
+	switch mutation {
+	case opAdd:
+		if !slices.Contains(kg.Keyspaces, keyspaceID) {
+			kg.Keyspaces = append(kg.Keyspaces, keyspaceID)
+			changed = true
+		}
+	case opDelete:
+		lenOfKeyspaces := len(kg.Keyspaces)
+		kg.Keyspaces = slice.Remove(kg.Keyspaces, keyspaceID)
+		changed = lenOfKeyspaces != len(kg.Keyspaces)
+	}
+	if !changed {
+		return kg, nil
+	}
+	if err := m.store.SaveKeyspaceGroup(txn, kg); err != nil {
+		return nil, err
+	}
+	return kg, nil
 }
 
 // UpdateKeyspaceGroup updates the keyspace group.

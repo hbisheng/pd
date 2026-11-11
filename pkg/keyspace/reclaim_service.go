@@ -32,6 +32,7 @@ import (
 
 type idReuseConfig interface {
 	IsIDReuseEnabled() bool
+	IsEncryptedIDReuseEnabled() bool
 	GetIDReuseThreshold() uint64
 	GetIDReuseBucketBytes() int
 	GetIDReuseLoadPageBuckets() int
@@ -48,6 +49,7 @@ type idReuse struct {
 	store     *reuseLeaderStore
 	watermark uint64
 	threshold uint64
+	encrypted bool
 }
 
 type reuseLeaderStore struct {
@@ -106,7 +108,7 @@ func (manager *Manager) StartIDReuse(backend kv.Base, leaderKey, leaderValue str
 		}
 	}
 	r := &idReuse{ctx: ctx, cancel: cancel, done: make(chan struct{}), bitmap: bitmap, store: guarded, watermark: watermark,
-		threshold: cfg.GetIDReuseThreshold(), limiter: rate.NewLimiter(rate.Every(cfg.GetIDReuseReclaimInterval()), 1)}
+		threshold: cfg.GetIDReuseThreshold(), encrypted: cfg.IsEncryptedIDReuseEnabled(), limiter: rate.NewLimiter(rate.Every(cfg.GetIDReuseReclaimInterval()), 1)}
 	manager.reuse.Store(r)
 	go func() {
 		defer close(r.done)

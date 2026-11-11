@@ -922,6 +922,8 @@ type KeyspaceConfig struct {
 	CheckRegionSplitInterval typeutil.Duration `toml:"check-region-split-interval" json:"check-region-split-interval"`
 	// EnableIDReuse enables the experimental deleted-keyspace ID reuse path.
 	EnableIDReuse bool `toml:"enable-id-reuse" json:"enable-id-reuse"`
+	// EnableEncryptedIDReuse is a legacy-encryption reuse; defaults to plaintext reuse.
+	EnableEncryptedIDReuse bool `toml:"enable-encrypted-id-reuse" json:"enable-encrypted-id-reuse"`
 	// IDReuseBucketBytes selects the persisted bitmap layout, immutable once installed.
 	IDReuseBucketBytes int `toml:"id-reuse-bucket-bytes" json:"id-reuse-bucket-bytes"`
 	// IDReuseLoadPageBuckets bounds the numeric bucket interval of each cache read.
@@ -1100,3 +1102,6 @@ func (c *KeyspaceConfig) GetIDReuseReclaimInterval() time.Duration {
 	}
 	return c.IDReuseReclaimInterval.Duration
 }
+
+// IsEncryptedIDReuseEnabled enables legacy encryption reuse when explicitly configured.
+func (c *KeyspaceConfig) IsEncryptedIDReuseEnabled() bool { return c.EnableEncryptedIDReuse }

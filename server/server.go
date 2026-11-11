@@ -1263,7 +1263,7 @@ func (s *Server) UpdateKeyspaceConfig(newCfg *config.KeyspaceConfig) {
 }
 
 func (s *Server) setKeyspaceConfigInner(oldCfg, newCfg *config.KeyspaceConfig, updateKeyspaceManager bool) error {
-	if oldCfg.EnableIDReuse != newCfg.EnableIDReuse ||
+	if oldCfg.EnableIDReuse != newCfg.EnableIDReuse || oldCfg.EnableEncryptedIDReuse != newCfg.EnableEncryptedIDReuse ||
 		oldCfg.GetIDReuseBucketBytes() != newCfg.GetIDReuseBucketBytes() || oldCfg.GetIDReuseThreshold() != newCfg.GetIDReuseThreshold() ||
 		oldCfg.GetIDReuseLoadPageBuckets() != newCfg.GetIDReuseLoadPageBuckets() || oldCfg.GetIDReuseLoadInterval() != newCfg.GetIDReuseLoadInterval() ||
 		oldCfg.GetIDReuseReclaimInterval() != newCfg.GetIDReuseReclaimInterval() {
@@ -2273,6 +2273,7 @@ func (s *Server) loadKeyspaceConfig() {
 	// must not override the operator's current startup configuration.
 	startup := &s.cfg.Keyspace
 	cfg.EnableIDReuse = startup.EnableIDReuse
+	cfg.EnableEncryptedIDReuse = startup.EnableEncryptedIDReuse
 	cfg.IDReuseBucketBytes = startup.IDReuseBucketBytes
 	cfg.IDReuseThreshold = startup.IDReuseThreshold
 	cfg.IDReuseLoadPageBuckets = startup.IDReuseLoadPageBuckets

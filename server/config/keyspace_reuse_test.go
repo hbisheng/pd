@@ -28,6 +28,7 @@ func TestKeyspaceIDReuseConfiguration(t *testing.T) {
 	require.NoError(t, cfg.Adjust(nil, false))
 	c := cfg.Keyspace
 	require.False(t, c.IsIDReuseEnabled())
+	require.False(t, c.IsEncryptedIDReuseEnabled())
 	require.Equal(t, uint64(1_000_000), c.GetIDReuseThreshold())
 	require.Equal(t, 64, c.GetIDReuseBucketBytes())
 	require.Equal(t, 64, c.GetIDReuseLoadPageBuckets())
