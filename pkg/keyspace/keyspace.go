@@ -114,8 +114,6 @@ type Manager struct {
 	keyspaceStateLookup  sync.Map // store as ID(uint32) -> state(keyspacepb.KeyspaceState)
 	cache                *Cache
 	gcBarrierInvalidator atomic.Pointer[func(uint32)]
-	reuse                atomic.Pointer[idReuse]
-	reuseLifecycleMu     sync.Mutex
 }
 
 // SetGCBarrierInvalidator installs the GC observation lifecycle callback.
@@ -558,9 +556,6 @@ func (manager *Manager) saveNewKeyspace(keyspace *keyspacepb.KeyspaceMeta) error
 	defer manager.metaLock.Unlock(keyspace.GetId())
 
 	err := manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
-		if err := manager.rejectFreeID(txn, keyspace.GetId()); err != nil {
-			return err
-		}
 		// Save keyspace ID.
 		// Check if keyspace with that name already exists.
 		nameExists, _, err := manager.store.LoadKeyspaceID(txn, keyspace.Name)
