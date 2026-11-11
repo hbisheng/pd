@@ -279,7 +279,7 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 		return nil, err
 	}
 	if r := manager.reuse.Load(); r != nil {
-		meta, err := manager.createReusedKeyspace(r, request)
+		meta, err := manager.createReusedKeyspace(r, request, tracer)
 		if err != nil || meta != nil {
 			return meta, err
 		}

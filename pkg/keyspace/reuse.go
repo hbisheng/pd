@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strconv"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -180,7 +181,7 @@ func supportsReuseEncryption(config map[string]string, enabled bool) bool {
 
 // createReusedKeyspace is entered only while the explicitly enabled service is
 // active. Returning nil, nil leaves the ordinary Create path untouched.
-func (manager *Manager) createReusedKeyspace(r *idReuse, request *CreateKeyspaceRequest) (*keyspacepb.KeyspaceMeta, error) {
+func (manager *Manager) createReusedKeyspace(r *idReuse, request *CreateKeyspaceRequest, tracer *createKeyspaceTracer) (*keyspacepb.KeyspaceMeta, error) {
 	if !manager.reuseAdmitted(r) || !manager.transactionalReuseConfig(request.Config) || !supportsReuseEncryption(request.Config, r.encrypted) {
 		return nil, nil
 	}
@@ -201,12 +202,19 @@ func (manager *Manager) createReusedKeyspace(r *idReuse, request *CreateKeyspace
 	if kerneltype.IsNextGen() && config[GCManagementType] == "" {
 		config[GCManagementType] = KeyspaceLevelGC
 	}
+	configFinished := time.Now()
 	meta, err := manager.claimFreeKeyspace(r, request.Name, config, request.CreateTime)
 	if err != nil || meta == nil {
 		return meta, err
 	}
+	tracer.SetKeyspace(meta.GetId(), meta.Name)
+	// Claiming the ID also saves its metadata in one transaction.
+	createKeyspaceStepDurationGetConfig.Observe(configFinished.Sub(tracer.lastCheckTime).Seconds())
+	tracer.lastCheckTime = configFinished
+	tracer.OnAllocateIDFinished()
 	err = manager.initializeReusedKeyspace(r, meta)
 	if err == nil {
+		tracer.OnSplitRegionFinished()
 		err = manager.finishReusedKeyspace(r, meta, keyspacepb.KeyspaceState_ENABLED)
 	}
 	if err != nil {
@@ -215,6 +223,8 @@ func (manager *Manager) createReusedKeyspace(r *idReuse, request *CreateKeyspace
 		}
 		return nil, err
 	}
+	tracer.OnEnableKeyspaceFinished()
+	tracer.OnCreateKeyspaceComplete()
 	meta.State = keyspacepb.KeyspaceState_ENABLED
 	if manager.mgm != nil {
 		manager.mgm.AttachEndpoints(meta.Config)
@@ -371,12 +381,24 @@ func (manager *Manager) initializeReusedKeyspace(r *idReuse, meta *keyspacepb.Ke
 // finishReusedKeyspace verifies the claimed owner in the final transaction.
 // Cancellation never puts the ID back into the bitmap while a split is in flight.
 func (manager *Manager) finishReusedKeyspace(r *idReuse, expected *keyspacepb.KeyspaceMeta, state keyspacepb.KeyspaceState) error {
+	// Match config updates: exclude bulk removal before taking the metadata
+	// lock, because removal takes the group lock before inspecting metadata.
+	if state == keyspacepb.KeyspaceState_ENABLED && manager.kgm != nil {
+		manager.kgm.membershipMutationLock.Lock()
+		defer manager.kgm.membershipMutationLock.Unlock()
+	}
 	manager.metaLock.Lock(expected.GetId())
 	defer manager.metaLock.Unlock(expected.GetId())
+	var groupID uint64
+	var group *endpoint.KeyspaceGroup
 	if state == keyspacepb.KeyspaceState_ENABLED && manager.kgm != nil {
-		if err := manager.kgm.UpdateKeyspaceForGroup(endpoint.StringUserKind(expected.Config[UserKindKey]), expected.Config[TSOKeyspaceGroupIDKey], expected.GetId(), opAdd); err != nil {
+		var err error
+		groupID, err = strconv.ParseUint(expected.Config[TSOKeyspaceGroupIDKey], 10, 64)
+		if err != nil {
 			return err
 		}
+		manager.kgm.Lock()
+		defer manager.kgm.Unlock()
 	}
 	var finished *keyspacepb.KeyspaceMeta
 	err := r.store.RunInTxnWithConditions(r.ctx, nil, func(txn kv.Txn) error {
@@ -390,6 +412,13 @@ func (manager *Manager) finishReusedKeyspace(r *idReuse, expected *keyspacepb.Ke
 			}
 			return errors.New("reused creation changed before completion")
 		}
+		// Membership and ENABLED commit together under the same leader guard.
+		if state == keyspacepb.KeyspaceState_ENABLED && manager.kgm != nil {
+			group, err = manager.kgm.updateKeyspaceForGroupTxn(txn, endpoint.StringUserKind(meta.Config[UserKindKey]), groupID, meta.GetId(), opAdd)
+			if err != nil {
+				return err
+			}
+		}
 		meta.State = state
 		meta.StateChangedAt = time.Now().Unix()
 		if err := manager.store.SaveKeyspaceMeta(txn, meta); err != nil {
@@ -399,6 +428,9 @@ func (manager *Manager) finishReusedKeyspace(r *idReuse, expected *keyspacepb.Ke
 		return nil
 	})
 	if err == nil && finished != nil {
+		if group != nil {
+			manager.kgm.putKeyspaceGroupToCacheLocked(group)
+		}
 		expected.StateChangedAt = finished.StateChangedAt
 		manager.cache.Save(finished.GetId(), finished.Name, state)
 		manager.keyspaceStateLookup.Store(finished.GetId(), state)

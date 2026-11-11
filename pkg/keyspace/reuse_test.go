@@ -26,6 +26,7 @@ import (
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
 
+	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/mock/mockcluster"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
@@ -306,4 +307,176 @@ func TestIDReuseCancellationBeforeRuleInstallation(t *testing.T) {
 	require.NoError(t, err)
 	require.ErrorContains(t, m.initializeReusedKeyspace(r, meta), "cancelled")
 	require.Nil(t, cluster.GetRegionLabeler().GetLabelRule(buildLabelRule(42, txnRegionBound).ID))
+}
+
+func TestIDReuseCancelledFinishDoesNotAssignTSOGroup(t *testing.T) {
+	for _, mode := range []string{"archive", "leader-stop", "leader-change"} {
+		t.Run(mode, func(t *testing.T) {
+			m, cluster, backend := newReuseFixture(t, false)
+			reclaimForReuse(t, m, cluster)
+			r := m.reuse.Load()
+			meta, err := m.claimFreeKeyspace(r, "cancelled", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 10)
+			require.NoError(t, err)
+			group, err := m.kgm.GetKeyspaceGroupByID(0)
+			require.NoError(t, err)
+			require.NotContains(t, group.Keyspaces, uint32(42))
+			switch mode {
+			case "archive":
+				_, err = m.UpdateKeyspaceState("cancelled", keyspacepb.KeyspaceState_ARCHIVED, 11)
+				require.NoError(t, err)
+			case "leader-stop":
+				m.StopIDReuse()
+			default:
+				require.NoError(t, backend.Save(reuseTestLeaderKey, "next-leader"))
+			}
+			require.Error(t, m.finishReusedKeyspace(r, meta, keyspacepb.KeyspaceState_ENABLED))
+			group, err = m.kgm.GetKeyspaceGroupByID(0)
+			require.NoError(t, err)
+			require.NotContains(t, group.Keyspaces, uint32(42), "a rejected completion must not change TSO membership")
+		})
+	}
+}
+
+func TestIDReuseCreateRecordsTotalMetric(t *testing.T) {
+	m, cluster, _ := newReuseFixture(t, false)
+	reclaimForReuse(t, m, cluster)
+	before := getCreateKeyspaceStepCounts(require.New(t))[StepTotal]
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: "metric-reuse", CreateTime: 10})
+		done <- err
+	}()
+	waitReuseRule(t, cluster, 42)
+	cluster.PutRegion(reclaimRegion(42, 42))
+	cluster.PutRegion(reclaimRegion(43, 43))
+	require.NoError(t, <-done)
+	after := getCreateKeyspaceStepCounts(require.New(t))[StepTotal]
+	require.Equal(t, before+1, after)
+}
+
+func TestIDReuseNeighborSplitCompletesOrderedCreates(t *testing.T) {
+	m, cluster, _ := newReuseFixture(t, false)
+	for _, id := range []uint32{42, 43, 44} {
+		seedReclaimMeta(t, m, id, keyspacepb.KeyspaceState_TOMBSTONE)
+	}
+	cluster.PutRegion(reclaimRegion(42, 44))
+	for _, id := range []uint32{42, 43} {
+		ok, err := m.RequestKeyspaceReclaim(m.ctx, id)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	done := make(chan error, 2)
+	for _, id := range []uint32{42, 43} {
+		go func() {
+			meta, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: fmt.Sprintf("reuse-%d", id), CreateTime: 10})
+			if err == nil && meta.GetId() != id {
+				err = fmt.Errorf("claimed %d, expected %d", meta.GetId(), id)
+			}
+			done <- err
+		}()
+		waitReuseRule(t, cluster, id)
+	}
+	// The right boundary arrives first; a later split completes both Creates.
+	cluster.PutRegion(reclaimRegion(42, 43))
+	cluster.PutRegion(reclaimRegion(44, 44))
+	select {
+	case err := <-done:
+		t.Fatalf("Create finished before its boundaries existed: %v", err)
+	default:
+	}
+	cluster.PutRegion(reclaimRegion(42, 42))
+	cluster.PutRegion(reclaimRegion(43, 43))
+	require.NoError(t, <-done)
+	require.NoError(t, <-done)
+}
+
+func TestIDReuseFallbackPreservesFreeID(t *testing.T) {
+	for _, mode := range []string{"cold-cache", "cmek"} {
+		t.Run(mode, func(t *testing.T) {
+			m, cluster, backend := newReuseFixture(t, true)
+			reclaimForReuse(t, m, cluster)
+			config := map[string]string{"encryption": `{"enabled":true,"cmek_id":"customer"}`}
+			if mode == "cold-cache" {
+				m.StopIDReuse()
+				require.NoError(t, m.StartIDReuse(backend, reuseTestLeaderKey, "leader"))
+				config = nil
+			}
+			require.NoError(t, failpoint.Enable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion", "return(true)"))
+			t.Cleanup(func() { require.NoError(t, failpoint.Disable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion")) })
+			meta, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: "ordinary-fallback", Config: config, CreateTime: 10})
+			require.NoError(t, err)
+			require.Equal(t, uint32(1), meta.GetId())
+			bitmap := m.reuse.Load().bitmap
+			require.NoError(t, bitmap.loadNextPage(m.ctx, 1))
+			id, ok := bitmap.firstFree(42, 43)
+			require.True(t, ok)
+			require.Equal(t, uint32(42), id)
+		})
+	}
+}
+
+func TestIDReuseSameNameClaimsPreserveOtherFreeID(t *testing.T) {
+	m, cluster, _ := newReuseFixture(t, false)
+	for _, id := range []uint32{42, 43, 44} {
+		seedReclaimMeta(t, m, id, keyspacepb.KeyspaceState_TOMBSTONE)
+	}
+	cluster.PutRegion(reclaimRegion(42, 44))
+	for _, id := range []uint32{42, 43} {
+		ok, err := m.RequestKeyspaceReclaim(m.ctx, id)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	r := m.reuse.Load()
+	results := make(chan *keyspacepb.KeyspaceMeta, 2)
+	failures := make(chan error, 2)
+	for range 2 {
+		go func() {
+			meta, err := m.claimFreeKeyspace(r, "same-name", nil, 10)
+			results <- meta
+			failures <- err
+		}()
+	}
+	claimed := 0
+	for range 2 {
+		if meta := <-results; meta != nil {
+			claimed++
+		}
+		if err := <-failures; err != nil {
+			require.ErrorIs(t, err, errs.ErrKeyspaceExists)
+		}
+	}
+	require.Equal(t, 1, claimed)
+	// The failed transaction invalidates its bucket; reload before reuse.
+	require.NoError(t, r.bitmap.loadNextPage(m.ctx, 1))
+	id, ok := r.bitmap.firstFree(42, 44)
+	require.True(t, ok)
+	require.Equal(t, uint32(43), id)
+}
+
+func TestIDReuseInterruptedClaimRemainsOwned(t *testing.T) {
+	for _, mode := range []string{"restart", "split-before-initialization"} {
+		t.Run(mode, func(t *testing.T) {
+			m, cluster, backend := newReuseFixture(t, false)
+			reclaimForReuse(t, m, cluster)
+			r := m.reuse.Load()
+			meta, err := m.claimFreeKeyspace(r, "unfinished", nil, 10)
+			require.NoError(t, err)
+			if mode == "restart" {
+				m.StopIDReuse()
+				require.NoError(t, m.StartIDReuse(backend, reuseTestLeaderKey, "leader"))
+				r = m.reuse.Load()
+			} else {
+				cluster.PutRegion(reclaimRegion(42, 42))
+				cluster.PutRegion(reclaimRegion(43, 43))
+				require.ErrorContains(t, m.initializeReusedKeyspace(r, meta), "no longer requires split")
+			}
+			current, _, err := m.store.LoadKeyspaceMetaWithRevision(m.ctx, 42)
+			require.NoError(t, err)
+			require.Equal(t, keyspacepb.KeyspaceState_DISABLED, current.State)
+			require.NoError(t, m.finishReusedKeyspace(r, meta, keyspacepb.KeyspaceState_ARCHIVED))
+			require.NoError(t, r.bitmap.loadNextPage(m.ctx, 1))
+			_, free := r.bitmap.firstFree(42, 43)
+			require.False(t, free)
+		})
+	}
 }
