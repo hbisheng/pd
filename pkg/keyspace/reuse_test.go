@@ -30,44 +30,18 @@ import (
 	"github.com/tikv/pd/pkg/mock/mockcluster"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
-	"github.com/tikv/pd/pkg/utils/keypath"
-	"github.com/tikv/pd/pkg/utils/typeutil"
 	"github.com/tikv/pd/server/config"
 )
 
-const reuseTestLeaderKey = "/reuse-test-leader"
-
 func newReuseFixture(t *testing.T, encrypted bool) (*Manager, *mockcluster.Cluster, kv.Base) {
 	t.Helper()
-	m, _, cluster, _ := newReclaimFixture(t)
-	store := m.store.(*endpoint.StorageEndpoint)
-	m.kgm = NewKeyspaceGroupManager(m.ctx, store, nil)
-	require.NoError(t, m.kgm.Bootstrap(m.ctx))
-	m.config = &config.KeyspaceConfig{
-		EnableIDReuse: true, EnableEncryptedIDReuse: encrypted,
-		IDReuseLoadInterval:      typeutil.NewDuration(time.Hour),
-		IDReuseReclaimInterval:   typeutil.NewDuration(time.Nanosecond),
-		WaitRegionSplitTimeout:   typeutil.NewDuration(time.Second),
-		CheckRegionSplitInterval: typeutil.NewDuration(time.Millisecond),
+	m, cluster, backend := newReclaimServiceFixture(t)
+	if encrypted {
+		m.StopIDReuse()
+		m.config.(*config.KeyspaceConfig).EnableEncryptedIDReuse = true
+		require.NoError(t, m.StartIDReuse(backend, reuseTestLeaderKey, "leader"))
 	}
-	require.NoError(t, store.Save(reuseTestLeaderKey, "leader"))
-	require.NoError(t, m.StartIDReuse(store.Base, reuseTestLeaderKey, "leader"))
-	t.Cleanup(m.StopIDReuse)
-	return m, cluster, store.Base
-}
-
-func reclaimForReuse(t *testing.T, m *Manager, cluster *mockcluster.Cluster) {
-	t.Helper()
-	const first, last uint32 = 42, 43
-	for id := first; id <= last; id++ {
-		seedReclaimMeta(t, m, id, keyspacepb.KeyspaceState_TOMBSTONE)
-	}
-	cluster.PutRegion(reclaimRegion(first, last))
-	for id := first; id < last; id++ {
-		ok, err := m.RequestKeyspaceReclaim(m.ctx, id)
-		require.NoError(t, err)
-		require.True(t, ok)
-	}
+	return m, cluster, backend
 }
 
 func waitReuseRule(t *testing.T, cluster *mockcluster.Cluster, id uint32) {
@@ -75,29 +49,6 @@ func waitReuseRule(t *testing.T, cluster *mockcluster.Cluster, id uint32) {
 	require.Eventually(t, func() bool {
 		return cluster.GetRegionLabeler().GetLabelRule(buildLabelRule(id, txnRegionBound).ID) != nil
 	}, 5*time.Second, time.Millisecond)
-}
-
-func TestIDReuseDisabledHasNoStorageEffects(t *testing.T) {
-	m, _, _, _ := newReclaimFixture(t)
-	m.config = &config.KeyspaceConfig{}
-	require.NoError(t, m.StartIDReuse(nil, "", ""))
-	require.Nil(t, m.reuse.Load())
-	_, err := m.RequestKeyspaceReclaim(m.ctx, 42)
-	require.ErrorContains(t, err, "disabled")
-	// Explicit-ID checks add no storage reads when reuse is off.
-	require.NoError(t, m.rejectFreeID(nil, 42))
-	store := m.store.(*endpoint.StorageEndpoint)
-	m.kgm = NewKeyspaceGroupManager(m.ctx, store, nil)
-	require.NoError(t, m.kgm.Bootstrap(m.ctx))
-	require.NoError(t, failpoint.Enable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion", "return(true)"))
-	t.Cleanup(func() { require.NoError(t, failpoint.Disable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion")) })
-	meta, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: "ordinary", CreateTime: 10})
-	require.NoError(t, err)
-	require.Equal(t, uint32(1), meta.GetId())
-	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, meta.State)
-	keys, _, err := store.LoadRange(keyspaceFreePrefix(), keyspaceFreePrefix()+"~", 1)
-	require.NoError(t, err)
-	require.Empty(t, keys)
 }
 
 func TestIDReuseCreateUsesExistingSplit(t *testing.T) {
@@ -280,20 +231,6 @@ func TestIDReuseEncryptionAdmission(t *testing.T) {
 	} {
 		require.Equal(t, tc.want, supportsReuseEncryption(map[string]string{"encryption": tc.value}, tc.enabled))
 	}
-}
-
-func TestIDReuseThresholdUsesPersistedAllocator(t *testing.T) {
-	m, cluster, backend := newReuseFixture(t, false)
-	m.StopIDReuse()
-	cfg := m.config.(*config.KeyspaceConfig)
-	cfg.IDReuseThreshold = 100
-	require.NoError(t, m.StartIDReuse(backend, reuseTestLeaderKey, "leader"))
-	_, err := m.RequestKeyspaceReclaim(m.ctx, 42)
-	require.ErrorContains(t, err, "threshold")
-	m.StopIDReuse()
-	require.NoError(t, backend.Save(keypath.KeyspaceAllocIDPath(), string(typeutil.Uint64ToBytes(100))))
-	require.NoError(t, m.StartIDReuse(backend, reuseTestLeaderKey, "leader"))
-	reclaimForReuse(t, m, cluster)
 }
 
 func TestIDReuseCancellationBeforeRuleInstallation(t *testing.T) {

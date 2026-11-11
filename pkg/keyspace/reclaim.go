@@ -28,10 +28,10 @@ import (
 	"github.com/tikv/pd/pkg/storage/kv"
 )
 
-// Reclamation makes a deleted keyspace ID available to a future Create. Data
-// Cleaner first deletes the tenant's KV data and marks the keyspace TOMBSTONE;
-// it can then request reclamation as the empty Regions merge. This file handles
-// PD metadata cleanup and the free-ID bitmap, not KV data deletion.
+// Reclamation makes a deleted keyspace ID available to a future Create. After
+// data cleanup has completed and the keyspace is TOMBSTONE, an external caller
+// can request reclamation through the PD API as the empty Regions merge.
+// This file handles PD metadata cleanup and the free-ID bitmap.
 //
 // An ID is eligible only when one Region contains both its entire keyspace and
 // the entire next keyspace (ID + 1), and that neighbor is also deleted or free.
