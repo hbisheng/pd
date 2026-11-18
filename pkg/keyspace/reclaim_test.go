@@ -80,17 +80,21 @@ func TestReclaimEligibility(t *testing.T) {
 		name        string
 		first, last uint32
 		next        keyspacepb.KeyspaceState
+		missingNext bool
 		want        bool
 	}{
-		{"isolated", 42, 42, keyspacepb.KeyspaceState_TOMBSTONE, false},
-		{"merged only left", 41, 42, keyspacepb.KeyspaceState_TOMBSTONE, false},
-		{"active neighbor", 42, 43, keyspacepb.KeyspaceState_ENABLED, false},
-		{"merged right", 42, 43, keyspacepb.KeyspaceState_TOMBSTONE, true},
+		{"isolated", 42, 42, keyspacepb.KeyspaceState_TOMBSTONE, false, false},
+		{"merged only left", 41, 42, keyspacepb.KeyspaceState_TOMBSTONE, false, false},
+		{"active neighbor", 42, 43, keyspacepb.KeyspaceState_ENABLED, false, true},
+		{"merged right", 42, 43, keyspacepb.KeyspaceState_TOMBSTONE, false, true},
+		{"neighbor metadata absent and not free", 42, 43, keyspacepb.KeyspaceState_TOMBSTONE, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, b, cluster, _ := newReclaimFixture(t)
 			seedReclaimMeta(t, m, 42, keyspacepb.KeyspaceState_TOMBSTONE)
-			seedReclaimMeta(t, m, 43, tc.next)
+			if !tc.missingNext {
+				seedReclaimMeta(t, m, 43, tc.next)
+			}
 			cluster.PutRegion(reclaimRegion(tc.first, tc.last))
 			invalidations := 0
 			m.SetGCBarrierInvalidator(func(id uint32) { require.Equal(t, uint32(42), id); invalidations++ })
