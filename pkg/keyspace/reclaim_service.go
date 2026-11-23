@@ -17,6 +17,7 @@ package keyspace
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -41,6 +42,9 @@ type idReuseConfig interface {
 }
 
 type idReuse struct {
+	// Only one Create selects/claims at a time. Other Creates use fresh IDs;
+	// split initialization runs after this lock is released.
+	claimMu   sync.Mutex
 	ctx       context.Context
 	cancel    context.CancelFunc
 	done      chan struct{}

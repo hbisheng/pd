@@ -18,16 +18,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"maps"
-	"sort"
 	"strconv"
 	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
 
-	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/errs"
-	"github.com/tikv/pd/pkg/keyspace/constant"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
 	"github.com/tikv/pd/pkg/versioninfo/kerneltype"
@@ -101,41 +98,33 @@ func (manager *Manager) createReusedKeyspace(r *idReuse, request *CreateKeyspace
 	return meta, nil
 }
 
-func firstRegionKeyspace(region *core.RegionInfo) uint32 {
-	return uint32(sort.Search(int(constant.ReservedKeyspaceIDStart), func(id int) bool {
-		return bytes.Compare(MakeRegionBound(uint32(id)).TxnLeftBound, region.GetStartKey()) >= 0
-	}))
-}
-
+// claimFreeKeyspace is best effort before ownership is persisted. Busy claims,
+// loader reads and reclamation writes leave ordinary allocation available.
 func (manager *Manager) claimFreeKeyspace(r *idReuse, name string, config map[string]string, createdAt int64) (*keyspacepb.KeyspaceMeta, error) {
-	b := r.bitmap
-	b.mu.Lock()
-	buckets := append([]uint32(nil), b.freeBuckets...)
-	b.mu.Unlock()
+	if !r.claimMu.TryLock() {
+		return nil, nil
+	}
+	defer r.claimMu.Unlock()
+	candidates := r.bitmap.candidates()
 	seen := make(map[uint64]bool)
-	width := uint32(b.bucketBytes * 8)
-	for _, bucket := range buckets {
-		for start := bucket * width; start < (bucket+1)*width; {
-			id, ok := b.firstFree(start, (bucket+1)*width)
-			if !ok {
-				break
-			}
-			start = id + 1
-			if !reusableKeyspaceID(id) {
-				return nil, errors.New("protected ID in free bitmap")
-			}
-			region := manager.coveringKeyspaceRegion(id)
-			if region == nil || seen[region.GetID()] {
-				continue
-			}
-			seen[region.GetID()] = true
-			meta, err := manager.claimFreeKeyspaceID(r, id, name, config, createdAt)
-			if err != nil || meta != nil {
-				return meta, err
-			}
+	for {
+		id, ok := candidates.tryNext()
+		if !ok {
+			return nil, nil
+		}
+		if !reusableKeyspaceID(id) {
+			return nil, errors.New("protected ID in free bitmap")
+		}
+		region := manager.coveringKeyspaceRegion(id)
+		if region == nil || seen[region.GetID()] {
+			continue
+		}
+		seen[region.GetID()] = true
+		meta, err := manager.claimFreeKeyspaceID(r, id, name, config, createdAt)
+		if err != nil || meta != nil {
+			return meta, err
 		}
 	}
-	return nil, nil
 }
 
 func (manager *Manager) claimFreeKeyspaceID(r *idReuse, id uint32, name string, config map[string]string, createdAt int64) (*keyspacepb.KeyspaceMeta, error) {
@@ -146,14 +135,19 @@ func (manager *Manager) claimFreeKeyspaceID(r *idReuse, id uint32, name string, 
 	manager.metaLock.Lock(id)
 	defer manager.metaLock.Unlock(id)
 	b := r.bitmap
-	b.mu.Lock()
+	if !b.mu.TryLock() {
+		return nil, nil
+	}
 	defer b.mu.Unlock()
 	region := manager.coveringKeyspaceRegion(id)
 	if !manager.reuseAdmitted(r) || region == nil || !reusableKeyspaceID(id+1) || !regionCoversKeyspace(region.GetMeta(), MakeRegionBound(id+1)) {
 		return nil, nil
 	}
-	first, ok := b.firstFreeLocked(firstRegionKeyspace(region), id+1)
-	if !ok || first != id {
+	// Lookup releases the lock. Recheck both bits so a concurrent reclamation
+	// cannot make this claim split the middle of a consecutive free run.
+	free, known := b.isFreeLocked(id)
+	previousFree, previousKnown := b.isFreeLocked(id - 1)
+	if !known || !free || !previousKnown || previousFree {
 		return nil, nil
 	}
 	meta := &keyspacepb.KeyspaceMeta{Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: id}, Name: name, State: keyspacepb.KeyspaceState_DISABLED, CreatedAt: createdAt, StateChangedAt: createdAt, Config: maps.Clone(config)}

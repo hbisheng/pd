@@ -76,7 +76,7 @@ func TestIDReuseCreateUsesExistingSplit(t *testing.T) {
 			cluster.PutRegion(reclaimRegion(42, 42))
 			cluster.PutRegion(reclaimRegion(43, 43))
 			require.NoError(t, <-finished)
-			_, free := m.reuse.Load().bitmap.firstFree(42, 43)
+			_, free := m.reuse.Load().bitmap.candidates().Next()
 			require.False(t, free)
 			name, err := m.GetKeyspaceNameByID(42)
 			require.NoError(t, err)
@@ -109,7 +109,7 @@ func TestIDReuseTimeoutAndCancellation(t *testing.T) {
 			meta, _, err := m.store.LoadKeyspaceMetaWithRevision(m.ctx, 42)
 			require.NoError(t, err)
 			require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, meta.State)
-			_, free := m.reuse.Load().bitmap.firstFree(42, 43)
+			_, free := m.reuse.Load().bitmap.candidates().Next()
 			require.False(t, free)
 		})
 	}
@@ -345,7 +345,7 @@ func TestIDReuseFallbackPreservesFreeID(t *testing.T) {
 			require.Equal(t, uint32(1), meta.GetId())
 			bitmap := m.reuse.Load().bitmap
 			require.NoError(t, bitmap.loadNextPage(m.ctx, 1))
-			id, ok := bitmap.firstFree(42, 43)
+			id, ok := bitmap.candidates().Next()
 			require.True(t, ok)
 			require.Equal(t, uint32(42), id)
 		})
@@ -385,7 +385,7 @@ func TestIDReuseSameNameClaimsPreserveOtherFreeID(t *testing.T) {
 	require.Equal(t, 1, claimed)
 	// The failed transaction invalidates its bucket; reload before reuse.
 	require.NoError(t, r.bitmap.loadNextPage(m.ctx, 1))
-	id, ok := r.bitmap.firstFree(42, 44)
+	id, ok := r.bitmap.candidates().Next()
 	require.True(t, ok)
 	require.Equal(t, uint32(43), id)
 }
@@ -412,8 +412,87 @@ func TestIDReuseInterruptedClaimRemainsOwned(t *testing.T) {
 			require.Equal(t, keyspacepb.KeyspaceState_DISABLED, current.State)
 			require.NoError(t, m.finishReusedKeyspace(r, meta, keyspacepb.KeyspaceState_ARCHIVED))
 			require.NoError(t, r.bitmap.loadNextPage(m.ctx, 1))
-			_, free := r.bitmap.firstFree(42, 43)
+			_, free := r.bitmap.candidates().Next()
 			require.False(t, free)
 		})
 	}
+}
+
+func TestIDReuseBusyFallsBackWithoutWaiting(t *testing.T) {
+	for _, mode := range []string{"another-claim", "bitmap-io"} {
+		t.Run(mode, func(t *testing.T) {
+			m, cluster, _ := newReuseFixture(t, false)
+			reclaimForReuse(t, m, cluster)
+			r := m.reuse.Load()
+			require.NoError(t, failpoint.Enable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion", "return(true)"))
+			t.Cleanup(func() { require.NoError(t, failpoint.Disable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion")) })
+			lock := &r.claimMu
+			if mode == "bitmap-io" {
+				lock = &r.bitmap.mu
+			}
+			// Keep the competing lock held until Create finishes. The new owner
+			// must come from the increasing allocator without waiting for reuse.
+			func() {
+				lock.Lock()
+				defer lock.Unlock()
+				type result struct {
+					meta *keyspacepb.KeyspaceMeta
+					err  error
+				}
+				done := make(chan result, 1)
+				go func() {
+					meta, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: "busy-fallback", CreateTime: 10})
+					done <- result{meta: meta, err: err}
+				}()
+				select {
+				case got := <-done:
+					require.NoError(t, got.err)
+					require.Equal(t, uint32(1), got.meta.GetId())
+					require.Equal(t, keyspacepb.KeyspaceState_ENABLED, got.meta.State)
+				case <-time.After(5 * time.Second):
+					t.Fatal("Create waited for the busy reuse path")
+				}
+			}()
+			id, ok := r.bitmap.candidates().Next()
+			require.True(t, ok)
+			require.Equal(t, uint32(42), id)
+			// Once contention ends, the same free ID can still be claimed.
+			meta, err := m.claimFreeKeyspace(r, "after-busy", nil, 11)
+			require.NoError(t, err)
+			require.Equal(t, uint32(42), meta.GetId())
+		})
+	}
+}
+
+func TestIDReuseSkipsClaimWhenBitmapBecomesBusy(t *testing.T) {
+	m, cluster, _ := newReuseFixture(t, false)
+	reclaimForReuse(t, m, cluster)
+	r := m.reuse.Load()
+	id, ok := r.bitmap.candidates().Next()
+	require.True(t, ok)
+	// The loader or reclamation may take the lock after candidate selection.
+	func() {
+		r.bitmap.mu.Lock()
+		defer r.bitmap.mu.Unlock()
+		done := make(chan error, 1)
+		go func() {
+			meta, err := m.claimFreeKeyspaceID(r, id, "busy-claim", nil, 10)
+			if meta != nil {
+				err = fmt.Errorf("unexpected claim: %v", meta)
+			}
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("claim waited for bitmap I/O")
+		}
+	}()
+	meta, _, err := m.store.LoadKeyspaceMetaWithRevision(m.ctx, id)
+	require.NoError(t, err)
+	require.Nil(t, meta)
+	stillFree, ok := r.bitmap.candidates().Next()
+	require.True(t, ok)
+	require.Equal(t, id, stillFree)
 }

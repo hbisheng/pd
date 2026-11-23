@@ -129,60 +129,237 @@ func TestFreeIDBitmap(t *testing.T) {
 		require.NoError(t, b.loadNextPage(ctx, 64))
 		require.Equal(t, uint32(64), b.nextLoad)
 		require.Equal(t, []kv.RawTxnOp{{Key: b.bucketKey(0), EndKey: b.bucketKey(64), Limit: 64, OpType: kv.RawTxnOpGetRange}}, store.lastRead)
-		_, ok := b.firstFree(0, 65*512)
+		_, ok := b.candidates().Next()
 		require.False(t, ok)
 		require.NoError(t, b.loadNextPage(ctx, 64))
-		id, ok := b.firstFree(0, 65*512)
+		id, ok := b.candidates().Next()
 		require.True(t, ok)
 		require.Equal(t, uint32(64*512), id)
 		reads := store.reads
-		b.firstFree(0, 65*512)
+		b.candidates().Next()
 		require.Equal(t, reads, store.reads)
 	})
 
-	t.Run("empty index skips pages and accepts later updates", func(t *testing.T) {
+	t.Run("empty index loads bounded pages and accepts later updates", func(t *testing.T) {
 		b, store := newBitmap(t)
 		reads := store.reads
 		require.NoError(t, b.loadNextPage(ctx, 64))
 		require.Equal(t, reads+1, store.reads)
-		require.Equal(t, 1, store.lastRead[0].Limit)
-		require.Equal(t, b.bucketCount(), b.nextLoad)
-		require.Empty(t, b.buckets, "known-empty buckets need no cache entries")
+		require.Equal(t, []kv.RawTxnOp{{Key: b.bucketKey(0), EndKey: b.bucketKey(64), Limit: 64, OpType: kv.RawTxnOpGetRange}}, store.lastRead)
+		require.Equal(t, uint32(64), b.nextLoad)
 		require.NoError(t, b.loadNextPage(ctx, 64))
 		require.NoError(t, b.update(ctx, 512, true, noMetadata))
-		require.Equal(t, reads+1, store.reads, "empty pages and later writes need no extra reads")
-		id, ok := b.firstFree(0, 1024)
+		require.Equal(t, reads+2, store.reads, "each page needs one read; cached writes need none")
+		require.Equal(t, uint32(128), b.nextLoad)
+		require.Equal(t, []kv.RawTxnOp{{Key: b.bucketKey(64), EndKey: b.bucketKey(128), Limit: 64, OpType: kv.RawTxnOpGetRange}}, store.lastRead)
+		id, ok := b.candidates().Next()
 		require.True(t, ok)
 		require.Equal(t, uint32(512), id)
 
 		// A failed write still invalidates a bucket inside the known prefix.
 		store.loseReply = true
 		require.Error(t, b.update(ctx, 511, true, noMetadata))
-		_, ok = b.firstFree(0, 1024)
+		_, ok = b.candidates().Next()
 		require.False(t, ok)
 		store.loseReply = false
 		require.NoError(t, b.loadNextPage(ctx, 64))
-		id, ok = b.firstFree(0, 1024)
+		id, ok = b.candidates().Next()
 		require.True(t, ok)
 		require.Equal(t, uint32(511), id)
+
+		for b.nextLoad < b.bucketCount() {
+			start := b.nextLoad
+			end := min(start+64, b.bucketCount())
+			reads := store.reads
+			require.NoError(t, b.loadNextPage(ctx, 64))
+			require.Equal(t, reads+1, store.reads)
+			require.Equal(t, end, b.nextLoad)
+			require.Equal(t, []kv.RawTxnOp{{Key: b.bucketKey(start), EndKey: b.bucketKey(end), Limit: int(end - start), OpType: kv.RawTxnOpGetRange}}, store.lastRead)
+		}
+		reads = store.reads
+		require.NoError(t, b.loadNextPage(ctx, 64))
+		require.Equal(t, reads, store.reads, "fully loaded index needs no further reads")
 	})
 
-	t.Run("unknown earlier bucket blocks selection", func(t *testing.T) {
+	t.Run("unknown predecessor blocks a consecutive free run", func(t *testing.T) {
 		b, _ := newBitmap(t)
 		require.NoError(t, b.update(ctx, 512, true, noMetadata))
-		_, ok := b.firstFree(0, 1024)
+		require.NoError(t, b.update(ctx, 513, true, noMetadata))
+		_, ok := b.candidates().Next()
 		require.False(t, ok)
 		require.NoError(t, b.update(ctx, 511, true, noMetadata))
-		id, ok := b.firstFree(0, 1024)
+		id, ok := b.candidates().Next()
 		require.True(t, ok)
 		require.Equal(t, uint32(511), id)
-		id, ok = b.firstFree(512, 1024)
-		require.True(t, ok)
-		require.Equal(t, uint32(512), id)
 		require.NoError(t, b.update(ctx, 511, false, noMetadata))
-		id, ok = b.firstFree(0, 1024)
+		id, ok = b.candidates().Next()
 		require.True(t, ok)
 		require.Equal(t, uint32(512), id)
+	})
+
+	t.Run("candidate selection checks only the preceding ID", func(t *testing.T) {
+		for _, tc := range []struct {
+			name             string
+			candidate        uint32
+			predecessorState string
+			found            bool
+		}{
+			{"middle with unknown predecessor bucket", 513, "unknown", true},
+			{"middle with invalid predecessor bucket", 513, "invalid", true},
+			{"boundary with unknown predecessor bucket", 512, "unknown", false},
+			{"boundary with invalid predecessor bucket", 512, "invalid", false},
+			{"boundary with known empty predecessor bucket", 512, "empty", true},
+			{"boundary with earlier unknown bucket", 1024, "empty", true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				b, store := newBitmap(t)
+				require.NoError(t, b.update(ctx, tc.candidate, true, noMetadata))
+				previousBucket := tc.candidate/512 - 1
+				previousID := previousBucket * 512
+				switch tc.predecessorState {
+				case "empty":
+					require.NoError(t, b.update(ctx, previousID, true, noMetadata))
+					require.NoError(t, b.update(ctx, previousID, false, noMetadata))
+				case "invalid":
+					err := b.update(ctx, previousID, true, func(kv.Txn) error {
+						return errors.New("injected metadata failure")
+					})
+					require.Error(t, err)
+				}
+				reads := store.reads
+				id, found := b.candidates().Next()
+				require.Equal(t, tc.found, found)
+				if found {
+					require.Equal(t, tc.candidate, id)
+				}
+				require.Equal(t, reads, store.reads)
+			})
+		}
+	})
+
+	t.Run("blocked boundary does not block later bucket", func(t *testing.T) {
+		b, store := newBitmap(t)
+		require.NoError(t, b.update(ctx, 512, true, noMetadata))
+		require.NoError(t, b.update(ctx, 1024, true, noMetadata))
+		reads := store.reads
+		id, found := b.candidates().Next()
+		require.True(t, found)
+		require.Equal(t, uint32(1024), id, "512 is blocked, but 1023 is known non-free")
+		require.Equal(t, reads, store.reads)
+
+		require.NoError(t, b.update(ctx, 1023, true, noMetadata))
+		id, found = b.candidates().Next()
+		require.True(t, found)
+		require.Equal(t, uint32(1023), id, "1023 starts a separate free run")
+		require.Equal(t, reads, store.reads)
+	})
+
+	t.Run("cursor resumes without claiming skipped candidates", func(t *testing.T) {
+		b, store := newBitmap(t)
+		for _, id := range []uint32{7, 8, 510, 512} {
+			require.NoError(t, b.update(ctx, id, true, noMetadata))
+		}
+		reads := store.reads
+		cursor := b.candidates()
+		for _, expected := range []uint32{7, 510, 512} {
+			id, found := cursor.Next()
+			require.True(t, found)
+			require.Equal(t, expected, id)
+		}
+		_, found := cursor.Next()
+		require.False(t, found)
+		id, found := b.candidates().Next()
+		require.True(t, found)
+		require.Equal(t, uint32(7), id, "skipping leaves the free bit set")
+		require.Equal(t, reads, store.reads)
+
+		require.NoError(t, b.update(ctx, 513, true, noMetadata))
+		_, found = cursor.Next()
+		require.False(t, found, "exhausted cursors stay exhausted")
+	})
+
+	t.Run("blocked run does not block a later run in the same bucket", func(t *testing.T) {
+		b, store := newBitmap(t)
+		for _, id := range []uint32{512, 513, 515} {
+			require.NoError(t, b.update(ctx, id, true, noMetadata))
+		}
+		reads := store.reads
+		id, found := b.candidates().Next()
+		require.True(t, found)
+		require.Equal(t, uint32(515), id)
+		require.Equal(t, reads, store.reads)
+	})
+
+	t.Run("consecutive candidates depend on the preceding claim", func(t *testing.T) {
+		for _, first := range []uint32{7, 511, 512} {
+			for _, succeeds := range []bool{false, true} {
+				t.Run(fmt.Sprintf("first=%d/succeeds=%t", first, succeeds), func(t *testing.T) {
+					b, store := newBitmap(t)
+					for _, id := range []uint32{first, first + 1, first + 3} {
+						require.NoError(t, b.update(ctx, id, true, noMetadata))
+					}
+					require.NoError(t, b.loadNextPage(ctx, 2))
+					cursor := b.candidates()
+					id, found := cursor.Next()
+					require.True(t, found)
+					require.Equal(t, first, id)
+
+					err := b.update(ctx, first, false, func(kv.Txn) error {
+						if !succeeds {
+							return errors.New("claim failed")
+						}
+						return nil
+					})
+					expected := first + 1
+					if succeeds {
+						require.NoError(t, err)
+					} else {
+						require.ErrorContains(t, err, "claim failed")
+						// Reload the invalidated bucket: the failed claim left
+						// the first ID free, so skip the rest of that run.
+						require.NoError(t, b.loadNextPage(ctx, 2))
+						expected = first + 3
+					}
+					reads := store.reads
+					id, found = cursor.Next()
+					require.True(t, found)
+					require.Equal(t, expected, id)
+					require.Equal(t, reads, store.reads)
+				})
+			}
+		}
+	})
+
+	t.Run("cursor handles bucket removal and earlier insertion", func(t *testing.T) {
+		b, _ := newBitmap(t)
+		require.NoError(t, b.update(ctx, 511, true, noMetadata))
+		require.NoError(t, b.update(ctx, 512, true, noMetadata))
+		cursor := b.candidates()
+		id, found := cursor.Next()
+		require.True(t, found)
+		require.Equal(t, uint32(511), id)
+		require.NoError(t, b.update(ctx, 511, false, noMetadata))
+		require.NoError(t, b.update(ctx, 7, true, noMetadata))
+		id, found = cursor.Next()
+		require.True(t, found)
+		require.Equal(t, uint32(512), id)
+		id, found = b.candidates().Next()
+		require.True(t, found)
+		require.Equal(t, uint32(7), id)
+	})
+
+	t.Run("cursor sees invalidation between calls", func(t *testing.T) {
+		b, _ := newBitmap(t)
+		require.NoError(t, b.update(ctx, 7, true, noMetadata))
+		require.NoError(t, b.update(ctx, 513, true, noMetadata))
+		cursor := b.candidates()
+		id, found := cursor.Next()
+		require.True(t, found)
+		require.Equal(t, uint32(7), id)
+		require.NoError(t, backend.Save(b.bucketKey(1), b.buckets[1].Value))
+		require.ErrorIs(t, b.update(ctx, 513, false, noMetadata), errs.ErrEtcdTxnConflict)
+		_, found = cursor.Next()
+		require.False(t, found)
 	})
 
 	t.Run("metadata and bitmap commit together", func(t *testing.T) {
@@ -230,16 +407,16 @@ func TestFreeIDBitmap(t *testing.T) {
 		require.Empty(t, b.invalid)
 	})
 
-	t.Run("invalid earlier bucket blocks later free IDs", func(t *testing.T) {
+	t.Run("invalid predecessor blocks bucket-start candidate", func(t *testing.T) {
 		b, _ := newBitmap(t)
 		require.NoError(t, b.update(ctx, 511, true, noMetadata))
 		require.NoError(t, b.update(ctx, 512, true, noMetadata))
 		require.NoError(t, backend.Save(b.bucketKey(0), b.buckets[0].Value))
 		require.ErrorIs(t, b.update(ctx, 511, false, noMetadata), errs.ErrEtcdTxnConflict)
-		_, ok := b.firstFree(0, 1024)
+		_, ok := b.candidates().Next()
 		require.False(t, ok)
 		require.NoError(t, b.loadNextPage(ctx, 64))
-		id, ok := b.firstFree(0, 1024)
+		id, ok := b.candidates().Next()
 		require.True(t, ok)
 		require.Equal(t, uint32(511), id)
 	})
@@ -254,7 +431,7 @@ func TestFreeIDBitmap(t *testing.T) {
 		value, err := backend.Load(owner)
 		require.NoError(t, err)
 		require.Empty(t, value)
-		_, ok := b.firstFree(0, 512)
+		_, ok := b.candidates().Next()
 		require.False(t, ok)
 		require.NoError(t, b.loadNextPage(ctx, 64))
 		require.NoError(t, b.update(ctx, 1, false, noMetadata))
@@ -312,7 +489,7 @@ func TestFreeIDBitmap(t *testing.T) {
 		require.NoError(t, restarted.initialize(ctx))
 		require.NoError(t, restarted.loadNextPage(ctx, 1))
 		for expected := range uint32(32) {
-			id, ok := restarted.firstFree(0, 512)
+			id, ok := restarted.candidates().Next()
 			require.True(t, ok)
 			require.Equal(t, expected, id)
 			require.NoError(t, restarted.update(ctx, id, false, noMetadata))
@@ -346,7 +523,7 @@ func TestFreeIDBitmap(t *testing.T) {
 			require.NoError(t, b.initialize(ctx))
 			last := uint32(b.bucketBytes*8 - 1)
 			require.NoError(t, b.update(ctx, last, true, noMetadata))
-			id, ok := b.firstFree(0, last+1)
+			id, ok := b.candidates().Next()
 			require.True(t, ok)
 			require.Equal(t, last, id)
 		})

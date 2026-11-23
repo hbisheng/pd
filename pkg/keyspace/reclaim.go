@@ -34,7 +34,8 @@ import (
 // This file handles PD metadata cleanup and the free-ID bitmap.
 //
 // An ID is eligible only when one Region contains both its entire keyspace and
-// the entire next keyspace (ID + 1), and that neighbor is also deleted or free.
+// the entire next keyspace (ID + 1). Neighbor metadata and free bits do not
+// determine eligibility; the Region boundaries establish the room for a split.
 // For example, after adjacent deleted A and B merge, A can be reclaimed while B
 // stays unreclaimed. An isolated keyspace is deferred. Keeping the last ID out of the
 // free pool lets reuse follow the existing Create/split initialization path.
@@ -42,8 +43,6 @@ import (
 // Reclamation atomically removes the old metadata, name mapping and meta-service
 // group assignment and sets the free bit. It does not create a new owner or
 // initialize Regions; the later Create claims the ID and rechecks boundaries.
-
-var errReclaimDeferred = errors.New("keyspace is not eligible for reclamation")
 
 // reusableKeyspaceID excludes the default keyspace and reserved ID range.
 func reusableKeyspaceID(id uint32) bool {
@@ -85,7 +84,7 @@ func (manager *Manager) coveringKeyspaceRegion(id uint32) *core.RegionInfo {
 //
 // A true result confirms reclamation, including a reconciled commit whose reply
 // was lost. False with no error means the metadata is already absent or the
-// current Region/neighbor conditions defer reclamation. Invalid requests and
+// current Region boundaries defer reclamation. Invalid requests and
 // storage failures return errors. Deferred or failed requests can be retried.
 func (manager *Manager) reclaimKeyspace(ctx context.Context, bitmap *freeIDBitmap, id uint32) (bool, error) {
 	if !reusableKeyspaceID(id) {
@@ -131,27 +130,6 @@ func (manager *Manager) reclaimKeyspaceLocked(ctx context.Context, bitmap *freeI
 			current.CreatedAt != meta.CreatedAt || !manager.transactionalReuseConfig(current.Config) {
 			return errs.ErrEtcdTxnConflict.FastGenByArgs()
 		}
-		// Missing neighbor metadata alone is insufficient: it may be an unused ID
-		// or a failed creation. Require either TOMBSTONE metadata or a persisted
-		// free bit. Transaction read comparisons reject a concurrent neighbor claim.
-		next, err := manager.store.LoadKeyspaceMeta(txn, id+1)
-		if err != nil {
-			return err
-		}
-		if next != nil {
-			if next.State != keyspacepb.KeyspaceState_TOMBSTONE || !manager.transactionalReuseConfig(next.Config) {
-				return errReclaimDeferred
-			}
-		} else {
-			width := uint32(bitmap.bucketBytes * 8)
-			bits, err := txn.Load(bitmap.bucketKey((id + 1) / width))
-			if err != nil {
-				return err
-			}
-			if len(bits) != bitmap.bucketBytes || bits[((id+1)%width)/8]&(1<<((id+1)%8)) == 0 {
-				return errReclaimDeferred
-			}
-		}
 		exists, mappedID, err := manager.store.LoadKeyspaceID(txn, current.Name)
 		if err != nil {
 			return err
@@ -164,9 +142,6 @@ func (manager *Manager) reclaimKeyspaceLocked(ctx context.Context, bitmap *freeI
 		}
 		return manager.store.RemoveKeyspace(txn, id, current.Name)
 	})
-	if errors.ErrorEqual(err, errReclaimDeferred) {
-		return false, nil
-	}
 	// etcd may have committed before its reply was lost. Confirm both effects
 	// from storage before reporting success: the old metadata is gone and the
 	// ID is free. A transport error alone must not undo or repeat the deletion.
