@@ -33,11 +33,12 @@ import (
 
 type bitmapTestStore struct {
 	freeIDBitmapStore
-	reads     int
-	failRead  bool
-	loseReply bool
-	afterRead func()
-	lastRead  []kv.RawTxnOp
+	reads       int
+	failRead    bool
+	loseReply   bool
+	afterCommit func()
+	afterRead   func()
+	lastRead    []kv.RawTxnOp
 }
 
 type bitmapTestTxn struct {
@@ -69,6 +70,9 @@ func (txn *bitmapTestTxn) Commit() (kv.RawTxnResponse, error) {
 
 func (s *bitmapTestStore) RunInTxnWithConditions(ctx context.Context, conditions []clientv3.Cmp, f func(kv.Txn) error) error {
 	err := s.freeIDBitmapStore.RunInTxnWithConditions(ctx, conditions, f)
+	if err == nil && s.afterCommit != nil {
+		s.afterCommit()
+	}
 	if err == nil && s.loseReply {
 		return errors.New("injected lost commit response")
 	}

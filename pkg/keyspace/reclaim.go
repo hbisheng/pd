@@ -28,6 +28,7 @@ import (
 	"github.com/tikv/pd/pkg/keyspace/constant"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
+	"github.com/tikv/pd/pkg/utils/etcdutil"
 )
 
 // Reclamation makes a deleted keyspace ID available to a future Create. After
@@ -171,11 +172,15 @@ func (manager *Manager) reclaimKeyspaceLocked(ctx context.Context, bitmap *freeI
 	// from storage before reporting success: the old metadata is gone and the
 	// ID is free. A transport error alone must not undo or repeat the deletion.
 	if err != nil && !errors.ErrorEqual(err, errs.ErrEtcdTxnConflict) {
-		current, _, readErr := manager.store.LoadKeyspaceMetaWithRevision(ctx, id)
+		// The caller may have timed out after commit. Give readback its own
+		// bounded context so metadata eviction and TSO cache updates still finish.
+		readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), etcdutil.DefaultRequestTimeout)
+		defer cancel()
+		current, _, readErr := manager.store.LoadKeyspaceMetaWithRevision(readCtx, id)
 		if readErr == nil && current == nil {
 			bitmap.mu.Lock()
 			bucket := id / uint32(bitmap.bucketBytes*8)
-			readErr = bitmap.loadRangeLocked(ctx, bucket, bucket+1)
+			readErr = bitmap.loadRangeLocked(readCtx, bucket, bucket+1)
 			bits := bitmap.buckets[bucket].Value
 			free := readErr == nil && len(bits) == bitmap.bucketBytes && bits[(id%uint32(bitmap.bucketBytes*8))/8]&(1<<(id%8)) != 0
 			bitmap.mu.Unlock()
