@@ -238,11 +238,12 @@ func TestReclaimGroupBindingIsAtomic(t *testing.T) {
 
 func TestReclaimRemovesTSOMembershipAtomically(t *testing.T) {
 	for _, tc := range []struct {
-		name                                    string
-		loseReply, conflict, splitting, merging bool
+		name                                               string
+		loseReply, conflict, splitting, merging, cancelled bool
 	}{
 		{name: "committed"},
 		{name: "lost commit reply", loseReply: true},
+		{name: "expired request", loseReply: true, cancelled: true},
 		{name: "leader changed", conflict: true},
 		{name: "group splitting", splitting: true},
 		{name: "group merging", merging: true},
@@ -277,7 +278,12 @@ func TestReclaimRemovesTSOMembershipAtomically(t *testing.T) {
 				// Reject the final commit after all three changes have been staged.
 				b.store = &reuseLeaderStore{freeIDBitmapStore: store, leaderKey: reuseTestLeaderKey, leaderValue: "old-leader"}
 			}
-			reclaimed, err := m.reclaimKeyspace(m.ctx, b, 42)
+			ctx, cancel := context.WithCancel(m.ctx)
+			defer cancel()
+			if tc.cancelled {
+				store.afterCommit = cancel
+			}
+			reclaimed, err := m.reclaimKeyspace(ctx, b, 42)
 			want := !tc.conflict && !tc.splitting && !tc.merging
 			require.Equal(t, want, reclaimed)
 			if want {
