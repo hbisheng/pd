@@ -108,7 +108,7 @@ func TestReclaimEligibility(t *testing.T) {
 				_, exists := m.keyspaceNameLookup.Load(uint32(42))
 				require.False(t, exists)
 				require.Equal(t, 1, invalidations)
-				id, ok := b.firstFree(0, 512)
+				id, ok := b.candidates().Next()
 				require.True(t, ok)
 				require.Equal(t, uint32(42), id)
 				again, err := m.reclaimKeyspace(m.ctx, b, 42)
@@ -153,7 +153,7 @@ func TestReclaimNeighborAlreadyFree(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, got)
 	require.NoError(t, b.loadNextPage(m.ctx, 2))
-	first, ok := b.firstFree(0, 1024)
+	first, ok := b.candidates().Next()
 	require.True(t, ok)
 	require.Equal(t, uint32(511), first)
 }
@@ -193,7 +193,7 @@ func TestReclaimPreservesOtherNameMapping(t *testing.T) {
 	meta, _, err := m.store.LoadKeyspaceMetaWithRevision(m.ctx, 42)
 	require.NoError(t, err)
 	require.NotNil(t, meta)
-	_, ok := b.firstFree(0, 512)
+	_, ok := b.candidates().Next()
 	require.False(t, ok)
 }
 
@@ -226,7 +226,7 @@ func TestReclaimGroupBindingIsAtomic(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, counts["group"])
 	require.NoError(t, b.loadNextPage(m.ctx, 1))
-	id, ok := b.firstFree(0, 512)
+	id, ok := b.candidates().Next()
 	require.True(t, ok)
 	require.Equal(t, uint32(42), id)
 	require.NoError(t, m.store.RunInTxn(m.ctx, func(txn kv.Txn) error {

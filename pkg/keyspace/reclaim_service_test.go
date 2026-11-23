@@ -113,7 +113,7 @@ func TestReclaimServiceKeepsCreateOnIncreasingAllocator(t *testing.T) {
 	meta, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: "after-reclaim", CreateTime: 10})
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), meta.GetId())
-	id, free := m.reuse.Load().bitmap.firstFree(42, 43)
+	id, free := m.reuse.Load().bitmap.candidates().Next()
 	require.True(t, free)
 	require.Equal(t, uint32(42), id)
 	// Explicit-ID Create must leave the free pool to its allocator.

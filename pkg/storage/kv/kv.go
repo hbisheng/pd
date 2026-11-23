@@ -140,7 +140,9 @@ type RevisionTxn interface {
 
 // CommittedRevisionTxn exposes the revision of a successfully committed transaction.
 // CommitRevision is available only after the enclosing transaction runner returns
-// nil. Callers can use it to update cached values without another storage read.
+// nil. For keys put by that transaction, it is their new ModRevision and
+// can be used for the next cached CAS without another storage read. The revision
+// does not describe unchanged keys and must not be used after a failed commit.
 type CommittedRevisionTxn interface {
 	Txn
 	CommitRevision() int64
