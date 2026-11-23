@@ -16,6 +16,7 @@ package keyspace
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"maps"
 	"strconv"
@@ -27,6 +28,7 @@ import (
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
+	"github.com/tikv/pd/pkg/utils/etcdutil"
 	"github.com/tikv/pd/pkg/versioninfo/kerneltype"
 )
 
@@ -246,7 +248,7 @@ func (manager *Manager) initializeReusedKeyspace(r *idReuse, meta *keyspacepb.Ke
 func (manager *Manager) finishReusedKeyspace(r *idReuse, expected *keyspacepb.KeyspaceMeta, state keyspacepb.KeyspaceState) error {
 	// Match config updates: exclude bulk removal before taking the metadata
 	// lock, because removal takes the group lock before inspecting metadata.
-	if state == keyspacepb.KeyspaceState_ENABLED && manager.kgm != nil {
+	if manager.kgm != nil {
 		manager.kgm.membershipMutationLock.Lock()
 		defer manager.kgm.membershipMutationLock.Unlock()
 	}
@@ -260,10 +262,24 @@ func (manager *Manager) finishReusedKeyspace(r *idReuse, expected *keyspacepb.Ke
 		if err != nil {
 			return err
 		}
+	}
+	if manager.kgm != nil {
 		manager.kgm.Lock()
 		defer manager.kgm.Unlock()
 	}
 	var finished *keyspacepb.KeyspaceMeta
+	loadFinishedGroup := func(txn kv.Txn) error {
+		group = nil
+		if manager.kgm == nil || finished == nil || finished.State != keyspacepb.KeyspaceState_ENABLED {
+			return nil
+		}
+		id, err := strconv.ParseUint(finished.Config[TSOKeyspaceGroupIDKey], 10, 32)
+		if err != nil {
+			return err
+		}
+		group, err = manager.kgm.store.LoadKeyspaceGroup(txn, uint32(id))
+		return err
+	}
 	err := r.store.RunInTxnWithConditions(r.ctx, nil, func(txn kv.Txn) error {
 		meta, err := manager.store.LoadKeyspaceMeta(txn, expected.GetId())
 		if err != nil {
@@ -271,6 +287,12 @@ func (manager *Manager) finishReusedKeyspace(r *idReuse, expected *keyspacepb.Ke
 		}
 		if !sameReusedKeyspace(meta, expected) || meta.State != keyspacepb.KeyspaceState_DISABLED {
 			if state == keyspacepb.KeyspaceState_ARCHIVED {
+				// An uncertain Enable may finish before cancellation gets here.
+				// Preserve that result and repair its caches instead of archiving it.
+				if sameReusedKeyspace(meta, expected) {
+					finished = meta
+					return loadFinishedGroup(txn)
+				}
 				return nil
 			}
 			return errors.New("reused creation changed before completion")
@@ -290,13 +312,42 @@ func (manager *Manager) finishReusedKeyspace(r *idReuse, expected *keyspacepb.Ke
 		finished = meta
 		return nil
 	})
-	if err == nil && finished != nil {
-		if group != nil {
-			manager.kgm.putKeyspaceGroupToCacheLocked(group)
+	if err != nil {
+		if finished == nil {
+			return err
 		}
+		// A lost commit reply must not leave ENABLED metadata with DISABLED
+		// caches. Read back while holding the same locks; never publish the
+		// staged values until storage confirms them. The request may have expired.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.ctx), etcdutil.DefaultRequestTimeout)
+		defer cancel()
+		readErr := manager.store.RunInTxn(ctx, func(txn kv.Txn) error {
+			var readErr error
+			finished, readErr = manager.store.LoadKeyspaceMeta(txn, expected.GetId())
+			if readErr != nil {
+				return readErr
+			}
+			return loadFinishedGroup(txn)
+		})
+		if readErr != nil {
+			manager.evictKeyspacesFromCache([]uint32{expected.GetId()})
+			return errors.Annotatef(readErr, "reconcile reused creation after %v", err)
+		}
+		if sameReusedKeyspace(finished, expected) && finished.State == state {
+			err = nil
+		}
+	}
+	if group != nil {
+		manager.kgm.putKeyspaceGroupToCacheLocked(group)
+	}
+	if finished == nil && err != nil {
+		manager.evictKeyspacesFromCache([]uint32{expected.GetId()})
+	}
+	if finished != nil {
 		expected.StateChangedAt = finished.StateChangedAt
-		manager.cache.Save(finished.GetId(), finished.Name, state)
-		manager.keyspaceStateLookup.Store(finished.GetId(), state)
+		manager.cache.Save(finished.GetId(), finished.Name, finished.State)
+		manager.keyspaceNameLookup.Store(finished.GetId(), finished.Name)
+		manager.keyspaceStateLookup.Store(finished.GetId(), finished.State)
 	}
 	return err
 }

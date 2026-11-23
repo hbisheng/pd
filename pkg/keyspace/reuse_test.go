@@ -22,7 +22,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
 
@@ -495,4 +497,145 @@ func TestIDReuseSkipsClaimWhenBitmapBecomesBusy(t *testing.T) {
 	stillFree, ok := r.bitmap.candidates().Next()
 	require.True(t, ok)
 	require.Equal(t, id, stillFree)
+}
+
+// Inject failures after staging or committing the final state, without changing
+// the read-only store used to reconcile the outcome.
+type reuseCompletionTestStore struct {
+	freeIDBitmapStore
+	abort  bool
+	cancel context.CancelFunc
+}
+
+func (s *reuseCompletionTestStore) RunInTxnWithConditions(ctx context.Context, conditions []clientv3.Cmp, f func(kv.Txn) error) error {
+	err := s.freeIDBitmapStore.RunInTxnWithConditions(ctx, conditions, func(txn kv.Txn) error {
+		if err := f(txn); err != nil {
+			return err
+		}
+		if s.abort {
+			return errors.New("injected abort before commit")
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	return errors.New("injected lost commit reply")
+}
+
+func TestIDReuseCompletionReconcilesCommitOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		state         keyspacepb.KeyspaceState
+		abort, cancel bool
+	}{
+		{name: "enabled", state: keyspacepb.KeyspaceState_ENABLED},
+		{name: "archived", state: keyspacepb.KeyspaceState_ARCHIVED},
+		{name: "expired request", state: keyspacepb.KeyspaceState_ENABLED, cancel: true},
+		{name: "aborted transaction", state: keyspacepb.KeyspaceState_ENABLED, abort: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, cluster, _ := newReuseFixture(t, false)
+			reclaimForReuse(t, m, cluster)
+			r := m.reuse.Load()
+			meta, err := m.claimFreeKeyspace(r, "new-owner", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 10)
+			require.NoError(t, err)
+			require.NotNil(t, meta)
+			ctx, cancel := context.WithCancel(r.ctx)
+			defer cancel()
+			store := *r.store
+			fault := &reuseCompletionTestStore{freeIDBitmapStore: store.freeIDBitmapStore, abort: tc.abort}
+			if tc.cancel {
+				fault.cancel = cancel
+			}
+			store.freeIDBitmapStore = fault
+			err = m.finishReusedKeyspace(&idReuse{ctx: ctx, store: &store}, meta, tc.state)
+			want := tc.state
+			if tc.abort {
+				require.Error(t, err)
+				want = keyspacepb.KeyspaceState_DISABLED
+			} else {
+				require.NoError(t, err)
+			}
+			persisted, _, err := m.store.LoadKeyspaceMetaWithRevision(m.ctx, 42)
+			require.NoError(t, err)
+			require.Equal(t, want, persisted.State)
+			cached, err := m.GetKeyspaceStateByID(42)
+			require.NoError(t, err)
+			require.Equal(t, want, cached)
+			group, err := m.kgm.GetKeyspaceGroupByID(0)
+			require.NoError(t, err)
+			cachedGroup, cacheErr := m.kgm.GetGroupByKeyspaceID(42)
+			if want == keyspacepb.KeyspaceState_ENABLED {
+				require.Contains(t, group.Keyspaces, uint32(42))
+				require.NoError(t, cacheErr)
+				require.Zero(t, cachedGroup)
+				name, err := m.GetEnabledKeyspaceNameByID(42)
+				require.NoError(t, err)
+				require.Equal(t, "new-owner", name)
+			} else {
+				require.NotContains(t, group.Keyspaces, uint32(42))
+				require.Error(t, cacheErr)
+			}
+		})
+	}
+}
+
+func TestIDReuseMovesTSOMembershipToNewGroup(t *testing.T) {
+	m, cluster, _ := newReuseFixture(t, false)
+	require.NoError(t, m.kgm.UpdateKeyspaceForGroup(endpoint.Basic, "0", 42, opAdd))
+	reclaimForReuse(t, m, cluster)
+	require.NoError(t, m.kgm.CreateKeyspaceGroups([]*endpoint.KeyspaceGroup{{ID: 1, UserKind: "basic"}}))
+	r := m.reuse.Load()
+	meta, err := m.claimFreeKeyspace(r, "new-owner", map[string]string{TSOKeyspaceGroupIDKey: "1", UserKindKey: "basic"}, 10)
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+	require.NoError(t, m.finishReusedKeyspace(r, meta, keyspacepb.KeyspaceState_ENABLED))
+	oldGroup, err := m.kgm.GetKeyspaceGroupByID(0)
+	require.NoError(t, err)
+	require.NotContains(t, oldGroup.Keyspaces, uint32(42))
+	newGroup, err := m.kgm.GetKeyspaceGroupByID(1)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, newGroup.Keyspaces)
+	cachedGroup, err := m.kgm.GetGroupByKeyspaceID(42)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), cachedGroup)
+}
+
+func TestIDReuseCancellationRefreshesCommittedCompletion(t *testing.T) {
+	m, cluster, _ := newReuseFixture(t, false)
+	reclaimForReuse(t, m, cluster)
+	r := m.reuse.Load()
+	meta, err := m.claimFreeKeyspace(r, "late-completion", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 10)
+	require.NoError(t, err)
+	// Model a completion that commits after readback, before cancellation.
+	// Keep the claim's DISABLED cache to reproduce the lost completion result.
+	func() {
+		m.kgm.Lock()
+		defer m.kgm.Unlock()
+		require.NoError(t, m.store.RunInTxn(m.ctx, func(txn kv.Txn) error {
+			if _, err := m.kgm.updateKeyspaceForGroupTxn(txn, endpoint.Basic, 0, 42, opAdd); err != nil {
+				return err
+			}
+			persisted, err := m.store.LoadKeyspaceMeta(txn, 42)
+			if err != nil {
+				return err
+			}
+			persisted.State = keyspacepb.KeyspaceState_ENABLED
+			return m.store.SaveKeyspaceMeta(txn, persisted)
+		}))
+	}()
+	require.NoError(t, m.finishReusedKeyspace(r, meta, keyspacepb.KeyspaceState_ARCHIVED))
+	persisted, _, err := m.store.LoadKeyspaceMetaWithRevision(m.ctx, 42)
+	require.NoError(t, err)
+	require.Equal(t, keyspacepb.KeyspaceState_ENABLED, persisted.State)
+	name, err := m.GetEnabledKeyspaceNameByID(42)
+	require.NoError(t, err)
+	require.Equal(t, "late-completion", name)
+	group, err := m.kgm.GetGroupByKeyspaceID(42)
+	require.NoError(t, err)
+	require.Zero(t, group)
 }
