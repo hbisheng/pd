@@ -235,3 +235,76 @@ func TestReclaimGroupBindingIsAtomic(t *testing.T) {
 		return err
 	}))
 }
+
+func TestReclaimRemovesTSOMembershipAtomically(t *testing.T) {
+	for _, tc := range []struct {
+		name                                    string
+		loseReply, conflict, splitting, merging bool
+	}{
+		{name: "committed"},
+		{name: "lost commit reply", loseReply: true},
+		{name: "leader changed", conflict: true},
+		{name: "group splitting", splitting: true},
+		{name: "group merging", merging: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, b, cluster, store := newReclaimFixture(t)
+			m.kgm = NewKeyspaceGroupManager(m.ctx, m.store.(*endpoint.StorageEndpoint), nil)
+			group := &endpoint.KeyspaceGroup{ID: 1, UserKind: "basic", Keyspaces: []uint32{42, 43}}
+			if tc.splitting {
+				group.SplitState = &endpoint.SplitState{SplitSource: 1}
+			}
+			if tc.merging {
+				group.MergeState = &endpoint.MergeState{MergeList: []uint32{2}}
+			}
+			require.NoError(t, m.kgm.CreateKeyspaceGroups([]*endpoint.KeyspaceGroup{group}))
+			seedReclaimMeta(t, m, 42, keyspacepb.KeyspaceState_TOMBSTONE)
+			require.NoError(t, m.store.RunInTxn(m.ctx, func(txn kv.Txn) error {
+				meta, err := m.store.LoadKeyspaceMeta(txn, 42)
+				if err != nil {
+					return err
+				}
+				meta.Config[TSOKeyspaceGroupIDKey] = "1"
+				// Group creation omits transition state; persist it for these cases.
+				if err := m.kgm.store.SaveKeyspaceGroup(txn, group); err != nil {
+					return err
+				}
+				return m.store.SaveKeyspaceMeta(txn, meta)
+			}))
+			cluster.PutRegion(reclaimRegion(42, 43))
+			store.loseReply = tc.loseReply
+			if tc.conflict {
+				// Reject the final commit after all three changes have been staged.
+				b.store = &reuseLeaderStore{freeIDBitmapStore: store, leaderKey: reuseTestLeaderKey, leaderValue: "old-leader"}
+			}
+			reclaimed, err := m.reclaimKeyspace(m.ctx, b, 42)
+			want := !tc.conflict && !tc.splitting && !tc.merging
+			require.Equal(t, want, reclaimed)
+			if want {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+			persisted, err := m.kgm.GetKeyspaceGroupByID(1)
+			require.NoError(t, err)
+			meta, _, err := m.store.LoadKeyspaceMetaWithRevision(m.ctx, 42)
+			require.NoError(t, err)
+			_, cacheErr := m.kgm.GetGroupByKeyspaceID(42)
+			if want {
+				require.Equal(t, []uint32{43}, persisted.Keyspaces)
+				require.Nil(t, meta)
+				require.Error(t, cacheErr)
+			} else {
+				require.Equal(t, []uint32{42, 43}, persisted.Keyspaces)
+				require.NotNil(t, meta)
+				require.NoError(t, cacheErr)
+			}
+			cachedGroup, err := m.kgm.GetGroupByKeyspaceID(43)
+			require.NoError(t, err)
+			require.Equal(t, uint32(1), cachedGroup)
+			require.NoError(t, b.loadNextPage(m.ctx, 1))
+			_, free := b.candidates().Next()
+			require.Equal(t, want, free)
+		})
+	}
+}
