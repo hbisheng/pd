@@ -17,6 +17,7 @@ package keyspace
 import (
 	"bytes"
 	"context"
+	"strconv"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
@@ -25,6 +26,7 @@ import (
 	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/keyspace/constant"
+	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
 )
 
@@ -40,9 +42,9 @@ import (
 // stays unreclaimed. An isolated keyspace is deferred. Keeping the last ID out of the
 // free pool lets reuse follow the existing Create/split initialization path.
 //
-// Reclamation atomically removes the old metadata, name mapping and meta-service
-// group assignment and sets the free bit. It does not create a new owner or
-// initialize Regions; the later Create claims the ID and rechecks boundaries.
+// Reclamation atomically removes the old metadata, name mapping, meta-service
+// assignment and TSO group membership, and sets the free bit. It does not create
+// a new owner or initialize Regions; Create claims the ID and rechecks boundaries.
 
 // reusableKeyspaceID excludes the default keyspace and reserved ID range.
 func reusableKeyspaceID(id uint32) bool {
@@ -90,6 +92,11 @@ func (manager *Manager) reclaimKeyspace(ctx context.Context, bitmap *freeIDBitma
 	if !reusableKeyspaceID(id) {
 		return false, newModifyProtectedKeyspaceError()
 	}
+	// Follow config updates: membership, meta-service group, metadata, TSO group.
+	if manager.kgm != nil {
+		manager.kgm.membershipMutationLock.Lock()
+		defer manager.kgm.membershipMutationLock.Unlock()
+	}
 	if manager.mgm != nil {
 		manager.mgm.RLock()
 		defer manager.mgm.RUnlock()
@@ -106,9 +113,9 @@ func (manager *Manager) reclaimKeyspace(ctx context.Context, bitmap *freeIDBitma
 	return reclaimed, err
 }
 
-// reclaimKeyspaceLocked requires the caller to hold the ID's metadata lock and,
-// when configured, the meta-service group manager's read lock. bitmap.update serializes the bitmap
-// mutation and includes the metadata callback in its revision-checked transaction.
+// reclaimKeyspaceLocked requires the metadata lock, membership mutation lock,
+// and meta-service group read lock when configured. bitmap.update includes the
+// metadata and group changes in its revision-checked transaction.
 func (manager *Manager) reclaimKeyspaceLocked(ctx context.Context, bitmap *freeIDBitmap, id uint32) (bool, error) {
 	meta, _, err := manager.store.LoadKeyspaceMetaWithRevision(ctx, id)
 	if err != nil || meta == nil {
@@ -120,6 +127,11 @@ func (manager *Manager) reclaimKeyspaceLocked(ctx context.Context, bitmap *freeI
 	region := manager.coveringKeyspaceRegion(id)
 	if region == nil || !reusableKeyspaceID(id+1) || !regionCoversKeyspace(region.GetMeta(), MakeRegionBound(id+1)) {
 		return false, nil
+	}
+	var group *endpoint.KeyspaceGroup
+	if manager.kgm != nil {
+		manager.kgm.Lock()
+		defer manager.kgm.Unlock()
 	}
 	err = bitmap.update(ctx, id, true, func(txn kv.Txn) error {
 		current, err := manager.store.LoadKeyspaceMeta(txn, id)
@@ -140,6 +152,19 @@ func (manager *Manager) reclaimKeyspaceLocked(ctx context.Context, bitmap *freeI
 		if err := manager.unassignKeyspaceFromMetaServiceGroup(txn, current); err != nil {
 			return err
 		}
+		if manager.kgm != nil {
+			groupID := uint64(constant.DefaultKeyspaceGroupID)
+			if configured := current.Config[TSOKeyspaceGroupIDKey]; configured != "" {
+				groupID, err = strconv.ParseUint(configured, 10, 32)
+				if err != nil {
+					return err
+				}
+			}
+			group, err = manager.kgm.updateKeyspaceForGroupTxn(txn, endpoint.StringUserKind(current.Config[UserKindKey]), groupID, id, opDelete)
+			if err != nil {
+				return err
+			}
+		}
 		return manager.store.RemoveKeyspace(txn, id, current.Name)
 	})
 	// etcd may have committed before its reply was lost. Confirm both effects
@@ -155,9 +180,12 @@ func (manager *Manager) reclaimKeyspaceLocked(ctx context.Context, bitmap *freeI
 			free := readErr == nil && len(bits) == bitmap.bucketBytes && bits[(id%uint32(bitmap.bucketBytes*8))/8]&(1<<(id%8)) != 0
 			bitmap.mu.Unlock()
 			if free {
-				return true, nil
+				err = nil
 			}
 		}
+	}
+	if err == nil && group != nil {
+		manager.kgm.putKeyspaceGroupToCacheLocked(group)
 	}
 	// A failed commit remains retryable. The bitmap invalidates its cached bucket;
 	// the next request rereads metadata and cannot repeat a committed deletion.
