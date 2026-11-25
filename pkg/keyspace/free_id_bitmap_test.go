@@ -26,6 +26,7 @@ import (
 
 	"github.com/pingcap/errors"
 
+	"github.com/tikv/pd/pkg/election"
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/storage/kv"
 	"github.com/tikv/pd/pkg/utils/etcdutil"
@@ -33,11 +34,14 @@ import (
 
 type bitmapTestStore struct {
 	freeIDBitmapStore
-	reads     int
-	failRead  bool
-	loseReply bool
-	afterRead func()
-	lastRead  []kv.RawTxnOp
+	reads         int
+	writes        int
+	failRead      bool
+	loseReply     bool
+	delayCommit   bool
+	pendingCommit func() error
+	afterRead     func()
+	lastRead      []kv.RawTxnOp
 }
 
 type bitmapTestTxn struct {
@@ -57,7 +61,7 @@ func (txn *bitmapTestTxn) Then(ops ...kv.RawTxnOp) kv.RawTxn {
 
 func (txn *bitmapTestTxn) Commit() (kv.RawTxnResponse, error) {
 	txn.store.reads++
-	if txn.store.failRead {
+	if txn.store.failRead && txn.store.lastRead[0].OpType == kv.RawTxnOpGetRange {
 		return kv.RawTxnResponse{}, errors.New("injected read failure")
 	}
 	resp, err := txn.RawTxn.Commit()
@@ -68,6 +72,21 @@ func (txn *bitmapTestTxn) Commit() (kv.RawTxnResponse, error) {
 }
 
 func (s *bitmapTestStore) RunInTxnWithConditions(ctx context.Context, conditions []clientv3.Cmp, f func(kv.Txn) error) error {
+	s.writes++
+	if s.delayCommit {
+		s.delayCommit = false
+		return s.freeIDBitmapStore.RunInTxnWithConditions(ctx, conditions, func(txn kv.Txn) error {
+			if err := f(txn); err != nil {
+				return err
+			}
+			// These delayed callbacks only stage writes. Abort the first commit,
+			// then replay the writes with the original CAS conditions on demand.
+			s.pendingCommit = func() error {
+				return s.freeIDBitmapStore.RunInTxnWithConditions(context.Background(), conditions, f)
+			}
+			return context.DeadlineExceeded
+		})
+	}
 	err := s.freeIDBitmapStore.RunInTxnWithConditions(ctx, conditions, f)
 	if err == nil && s.loseReply {
 		return errors.New("injected lost commit response")
@@ -81,9 +100,9 @@ func TestFreeIDBitmap(t *testing.T) {
 	backend := kv.NewEtcdKVBase(client)
 	ctx := context.Background()
 	noMetadata := func(kv.Txn) error { return nil }
-	newBitmap := func(t *testing.T) (*freeIDBitmap, *bitmapTestStore) {
+	newBitmap := func(t *testing.T, leadershipConditions ...clientv3.Cmp) (*freeIDBitmap, *bitmapTestStore) {
 		store := &bitmapTestStore{freeIDBitmapStore: backend}
-		b, err := newFreeIDBitmap(store, "/"+t.Name()+"/", defaultFreeIDBucketBytes)
+		b, err := newFreeIDBitmap(store, "/"+t.Name()+"/", defaultFreeIDBucketBytes, leadershipConditions)
 		require.NoError(t, err)
 		require.NoError(t, b.initialize(ctx))
 		return b, store
@@ -91,7 +110,7 @@ func TestFreeIDBitmap(t *testing.T) {
 
 	t.Run("construction is inert", func(t *testing.T) {
 		store := &bitmapTestStore{freeIDBitmapStore: backend}
-		b, err := newFreeIDBitmap(store, "/inert/", defaultFreeIDBucketBytes)
+		b, err := newFreeIDBitmap(store, "/inert/", defaultFreeIDBucketBytes, nil)
 		require.NoError(t, err)
 		require.Zero(t, store.reads)
 		require.Empty(t, b.buckets)
@@ -104,14 +123,16 @@ func TestFreeIDBitmap(t *testing.T) {
 
 	t.Run("layout survives restart", func(t *testing.T) {
 		b, store := newBitmap(t)
-		restarted, err := newFreeIDBitmap(store, b.prefix, defaultFreeIDBucketBytes)
+		restarted, err := newFreeIDBitmap(store, b.prefix, defaultFreeIDBucketBytes, nil)
 		require.NoError(t, err)
 		require.NoError(t, restarted.initialize(ctx))
-		resized, err := newFreeIDBitmap(store, b.prefix, 128)
+		resized, err := newFreeIDBitmap(store, b.prefix, 128, nil)
 		require.NoError(t, err)
 		require.ErrorContains(t, resized.initialize(ctx), "layout differs")
+		require.NoError(t, backend.Save(b.prefix+"layout", ""))
+		require.ErrorContains(t, resized.initialize(ctx), "layout differs", "an existing empty layout is invalid")
 		for _, size := range []int{0, -1, 3, 8192} {
-			_, err := newFreeIDBitmap(store, b.prefix, size)
+			_, err := newFreeIDBitmap(store, b.prefix, size, nil)
 			require.Error(t, err)
 		}
 	})
@@ -249,7 +270,7 @@ func TestFreeIDBitmap(t *testing.T) {
 			found            bool
 		}{
 			{"middle with unknown predecessor bucket", 513, "unknown", true},
-			{"middle with invalid predecessor bucket", 513, "invalid", true},
+			{"middle with invalid predecessor bucket", 513, "invalid", false},
 			{"boundary with unknown predecessor bucket", 512, "unknown", false},
 			{"boundary with invalid predecessor bucket", 512, "invalid", false},
 			{"boundary with known empty predecessor bucket", 512, "empty", true},
@@ -498,6 +519,37 @@ func TestFreeIDBitmap(t *testing.T) {
 		require.ErrorIs(t, err, errs.ErrEtcdTxnConflict)
 	})
 
+	t.Run("failed recovery reads do not rewrite layout", func(t *testing.T) {
+		b, store := newBitmap(t)
+		require.NoError(t, b.loadNextPage(ctx, 2))
+		store.loseReply = true
+		require.Error(t, b.update(ctx, 511, true, noMetadata))
+		store.loseReply = false
+		// The lock normally limits uncertainty to one write. Exercise recovery
+		// with another invalid bucket as well, without allowing more writes.
+		b.invalidateBucketLocked(1)
+		store.failRead = true
+		writes := store.writes
+		for range 3 {
+			require.Error(t, b.loadNextPage(ctx, 2))
+			require.Equal(t, writes+1, store.writes, "only the first attempt fences")
+		}
+		_, found := b.candidates().Next()
+		require.False(t, found)
+		require.ErrorContains(t, b.update(ctx, 513, true, noMetadata), "recovering")
+
+		store.failRead = false
+		require.NoError(t, b.loadNextPage(ctx, 2))
+		require.Len(t, b.invalid, 1)
+		store.failRead = true
+		require.Error(t, b.loadNextPage(ctx, 2))
+		require.Len(t, b.invalid, 1, "the successful read stays recovered")
+		store.failRead = false
+		require.NoError(t, b.loadNextPage(ctx, 2))
+		require.Empty(t, b.invalid)
+		require.Equal(t, writes+1, store.writes)
+	})
+
 	t.Run("cancelled read is not published", func(t *testing.T) {
 		b, store := newBitmap(t)
 		cancelCtx, cancel := context.WithCancel(ctx)
@@ -528,7 +580,7 @@ func TestFreeIDBitmap(t *testing.T) {
 		for err := range errorsCh {
 			require.NoError(t, err)
 		}
-		restarted, err := newFreeIDBitmap(backend, b.prefix, defaultFreeIDBucketBytes)
+		restarted, err := newFreeIDBitmap(backend, b.prefix, defaultFreeIDBucketBytes, nil)
 		require.NoError(t, err)
 		require.NoError(t, restarted.initialize(ctx))
 		require.NoError(t, restarted.loadNextPage(ctx, 1))
@@ -539,6 +591,88 @@ func TestFreeIDBitmap(t *testing.T) {
 			require.NoError(t, restarted.update(ctx, id, false, noMetadata))
 		}
 	})
+
+	// Deferred commits exercise both sides of the recovery fence.
+	for _, scenario := range []string{"old commit first", "old commit last", "lost fence reply", "late fence", "restart", "new term"} {
+		t.Run(scenario, func(t *testing.T) {
+			prefix := "/" + t.Name() + "/"
+			leadership := election.NewLeadership(client, prefix+"leader", "bitmap test", "pd")
+			t.Cleanup(leadership.Reset)
+			require.NoError(t, leadership.Campaign(60, "pd"))
+			term, ok := leadership.CaptureTerm()
+			require.True(t, ok)
+			conditions := term.Comparisons()
+			b, store := newBitmap(t, conditions...)
+			require.NoError(t, b.loadNextPage(ctx, 2))
+			require.NoError(t, b.update(ctx, 512, true, noMetadata))
+			metadataKey := prefix + "metadata"
+			require.NoError(t, backend.Save(metadataKey, "old"))
+			store.delayCommit = true
+			require.Error(t, b.update(ctx, 511, true, func(txn kv.Txn) error { return txn.Remove(metadataKey) }))
+			oldWrite := store.pendingCommit
+			require.NotNil(t, oldWrite)
+			require.Zero(t, b.layoutRevision)
+			_, found := b.candidates().Next()
+			require.False(t, found)
+			require.ErrorContains(t, b.update(ctx, 512, false, noMetadata), "recovering")
+			require.Error(t, b.loadRangeLocked(ctx, 0, 1), "plain rereads must not bypass fencing")
+
+			var oldFence func() error
+			switch scenario {
+			case "old commit first":
+				require.NoError(t, oldWrite())
+			case "lost fence reply", "late fence":
+				store.delayCommit = scenario == "late fence"
+				store.loseReply = scenario == "lost fence reply"
+				require.Error(t, b.loadNextPage(ctx, 2))
+				store.loseReply = false
+				require.Zero(t, b.layoutRevision)
+				if scenario == "late fence" {
+					oldFence = store.pendingCommit
+				}
+			case "restart", "new term":
+				if scenario == "new term" {
+					leadership.Reset()
+					// The same PD may be elected again, with a different lease.
+					require.NoError(t, leadership.Campaign(60, "pd"))
+					require.ErrorIs(t, b.loadNextPage(ctx, 2), errs.ErrEtcdTxnConflict)
+					stale, err := newFreeIDBitmap(backend, prefix, defaultFreeIDBucketBytes, conditions)
+					require.NoError(t, err)
+					require.ErrorIs(t, stale.initialize(ctx), errs.ErrEtcdTxnConflict)
+					term, ok = leadership.CaptureTerm()
+					require.True(t, ok)
+					conditions = term.Comparisons()
+				}
+				replacement, err := newFreeIDBitmap(backend, prefix, defaultFreeIDBucketBytes, conditions)
+				require.NoError(t, err)
+				require.NoError(t, replacement.initialize(ctx))
+				if scenario == "new term" {
+					require.ErrorIs(t, b.loadNextPage(ctx, 2), errs.ErrEtcdTxnConflict)
+				}
+				b = replacement
+			}
+			require.NoError(t, b.loadNextPage(ctx, 2))
+			id, found := b.candidates().Next()
+			require.True(t, found)
+			if scenario == "old commit first" {
+				require.Equal(t, uint32(511), id)
+			} else {
+				require.Equal(t, uint32(512), id)
+				require.NoError(t, b.update(ctx, 512, false, noMetadata))
+				if oldFence != nil {
+					require.ErrorIs(t, oldFence(), errs.ErrEtcdTxnConflict)
+				}
+				require.ErrorIs(t, oldWrite(), errs.ErrEtcdTxnConflict)
+			}
+			value, err := backend.Load(metadataKey)
+			require.NoError(t, err)
+			if scenario == "old commit first" {
+				require.Empty(t, value)
+			} else {
+				require.Equal(t, "old", value)
+			}
+		})
+	}
 
 	t.Run("loader stops on cancellation", func(t *testing.T) {
 		b, _ := newBitmap(t)
@@ -562,7 +696,7 @@ func TestFreeIDBitmap(t *testing.T) {
 
 	for _, size := range []int{1, 32, 64, 256, 1024} {
 		t.Run(fmt.Sprintf("bucket size %d", size), func(t *testing.T) {
-			b, err := newFreeIDBitmap(backend, "/"+t.Name()+"/", size)
+			b, err := newFreeIDBitmap(backend, "/"+t.Name()+"/", size, nil)
 			require.NoError(t, err)
 			require.NoError(t, b.initialize(ctx))
 			last := uint32(b.bucketBytes*8 - 1)
