@@ -42,6 +42,7 @@ import (
 // For example, after adjacent deleted A and B merge, A can be reclaimed while B
 // stays unreclaimed. An isolated keyspace is deferred. Keeping the last ID out of the
 // free pool lets reuse follow the existing Create/split initialization path.
+// Bucket-end IDs also stay unreclaimed so allocation has no cross-bucket dependency.
 //
 // Reclamation atomically removes the old metadata, name mapping, meta-service
 // assignment and TSO group membership, and sets the free bit. It does not create
@@ -86,12 +87,16 @@ func (manager *Manager) coveringKeyspaceRegion(id uint32) *core.RegionInfo {
 // bitmap whose transactions are fenced to the current PD leader.
 //
 // A true result confirms reclamation, including a reconciled commit whose reply
-// was lost. False with no error means the metadata is already absent or the
-// current Region boundaries defer reclamation. Invalid requests and
+// was lost. False with no error means a bucket-end ID, absent metadata, or
+// Region boundaries that defer reclamation. Invalid requests and
 // storage failures return errors. Deferred or failed requests can be retried.
 func (manager *Manager) reclaimKeyspace(ctx context.Context, bitmap *freeIDBitmap, id uint32) (bool, error) {
 	if !reusableKeyspaceID(id) {
 		return false, newModifyProtectedKeyspaceError()
+	}
+	// Keep bucket-end IDs unavailable without touching their metadata.
+	if (id+1)%uint32(bitmap.bucketBytes*8) == 0 {
+		return false, nil
 	}
 	// Follow config updates: membership, meta-service group, metadata, TSO group.
 	if manager.kgm != nil {

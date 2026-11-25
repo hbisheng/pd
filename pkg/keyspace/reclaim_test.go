@@ -137,25 +137,39 @@ func TestReclaimWaitsForCompleteRegion(t *testing.T) {
 	require.False(t, got)
 }
 
-func TestReclaimNeighborAlreadyFree(t *testing.T) {
-	m, b, cluster, _ := newReclaimFixture(t)
-	for _, id := range []uint32{511, 512, 513} {
+func TestReclaimAcrossBucketsKeepsBoundaryUnavailable(t *testing.T) {
+	m, b, cluster, store := newReclaimFixture(t)
+	for _, id := range []uint32{510, 511, 512, 513} {
 		seedReclaimMeta(t, m, id, keyspacepb.KeyspaceState_TOMBSTONE)
 	}
-	cluster.PutRegion(reclaimRegion(511, 513))
-	// Reclamation can arrive out of order, including across bitmap keys.
-	for _, id := range []uint32{512, 511} {
+	cluster.PutRegion(reclaimRegion(510, 513))
+	// Reserving 511 still allows 510 to use its neighboring range for a split.
+	for _, id := range []uint32{512, 510} {
 		got, err := m.reclaimKeyspace(m.ctx, b, id)
 		require.NoError(t, err)
 		require.True(t, got)
 	}
-	got, err := m.reclaimKeyspace(m.ctx, b, 513)
+	reads := store.reads
+	got, err := m.reclaimKeyspace(m.ctx, b, 511)
 	require.NoError(t, err)
 	require.False(t, got)
-	require.NoError(t, b.loadNextPage(m.ctx, 2))
+	require.Equal(t, reads, store.reads)
+	meta, _, err := m.store.LoadKeyspaceMetaWithRevision(m.ctx, 511)
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+	require.Equal(t, keyspacepb.KeyspaceState_TOMBSTONE, meta.State)
+	require.NoError(t, m.store.RunInTxn(m.ctx, func(txn kv.Txn) error {
+		exists, id, err := m.store.LoadKeyspaceID(txn, meta.Name)
+		require.True(t, exists)
+		require.Equal(t, uint32(511), id)
+		return err
+	}))
+	got, err = m.reclaimKeyspace(m.ctx, b, 513)
+	require.NoError(t, err)
+	require.False(t, got)
 	first, ok := b.candidates().Next()
 	require.True(t, ok)
-	require.Equal(t, uint32(511), first)
+	require.Equal(t, uint32(510), first)
 }
 
 func TestReclaimRejectsProtectedAndLiveKeyspaces(t *testing.T) {
