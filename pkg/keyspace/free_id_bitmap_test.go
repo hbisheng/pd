@@ -380,25 +380,37 @@ func TestFreeIDBitmap(t *testing.T) {
 		require.NoError(t, b.update(ctx, 3, true, noMetadata))
 	})
 
-	t.Run("callback failure rolls back both changes", func(t *testing.T) {
-		b, _ := newBitmap(t)
-		owner := b.prefix + "owner"
-		err := b.update(ctx, 1, true, func(txn kv.Txn) error {
-			if err := txn.Save(owner, "must not commit"); err != nil {
-				return err
+	for _, populated := range []bool{false, true} {
+		t.Run(fmt.Sprintf("callback failure preserves cache populated=%t", populated), func(t *testing.T) {
+			b, store := newBitmap(t)
+			require.NoError(t, b.loadNextPage(ctx, 1))
+			if populated {
+				require.NoError(t, b.update(ctx, 1, true, noMetadata))
 			}
-			return errors.New("cancelled by owner")
-		})
-		require.ErrorContains(t, err, "cancelled by owner")
-		for _, key := range []string{owner, b.bucketKey(0)} {
-			value, err := backend.Load(key)
+			cached := b.buckets[0]
+			reads := store.reads
+			owner := b.prefix + "owner"
+			err := b.update(ctx, 1, !populated, func(txn kv.Txn) error {
+				if err := txn.Save(owner, "must not commit"); err != nil {
+					return err
+				}
+				return errors.New("cancelled by owner")
+			})
+			require.ErrorContains(t, err, "cancelled by owner")
+			require.Equal(t, cached, b.buckets[0])
+			require.Empty(t, b.invalid)
+			_, found := b.candidates().Next()
+			require.Equal(t, populated, found)
+			value, err := backend.Load(owner)
 			require.NoError(t, err)
 			require.Empty(t, value)
-		}
-		require.NotContains(t, b.buckets, uint32(0))
-		require.NoError(t, b.loadNextPage(ctx, 64))
-		require.Empty(t, b.invalid)
-	})
+			value, err = backend.Load(b.bucketKey(0))
+			require.NoError(t, err)
+			require.Equal(t, cached.Value, value)
+			require.NoError(t, b.update(ctx, 1, !populated, noMetadata))
+			require.Equal(t, reads, store.reads, "callback rejection must not force a reload")
+		})
+	}
 
 	t.Run("same value rewrite invalidates stale cache", func(t *testing.T) {
 		b, _ := newBitmap(t)
