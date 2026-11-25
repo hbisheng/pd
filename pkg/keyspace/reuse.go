@@ -145,8 +145,8 @@ func (manager *Manager) claimFreeKeyspaceID(r *idReuse, id uint32, name string, 
 	if !manager.reuseAdmitted(r) || region == nil || !reusableKeyspaceID(id+1) || !regionCoversKeyspace(region.GetMeta(), MakeRegionBound(id+1)) {
 		return nil, nil
 	}
-	// Lookup releases the lock. Recheck both bits so a concurrent reclamation
-	// cannot make this claim split the middle of a consecutive free run.
+	// Lookup releases the lock. Recheck both bits before the bucket CAS.
+	// The reserved bucket-end ID makes a bucket-start predecessor always non-free.
 	free, known := b.isFreeLocked(id)
 	previousFree, previousKnown := b.isFreeLocked(id - 1)
 	if !known || !free || !previousKnown || previousFree {

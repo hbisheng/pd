@@ -131,32 +131,37 @@ func TestIDReuseSkipsUnreclaimedLowerID(t *testing.T) {
 	require.Equal(t, uint32(101), meta.GetId())
 }
 
-func TestIDReuseCrossBucketOrdering(t *testing.T) {
-	m, cluster, _ := newReuseFixture(t, false)
-	for _, id := range []uint32{511, 512, 513} {
-		seedReclaimMeta(t, m, id, keyspacepb.KeyspaceState_TOMBSTONE)
+func TestIDReuseBucketStartIgnoresNeighborCache(t *testing.T) {
+	for _, invalid := range []bool{false, true} {
+		t.Run(fmt.Sprintf("invalid=%t", invalid), func(t *testing.T) {
+			m, cluster, _ := newReuseFixture(t, false)
+			for _, id := range []uint32{511, 512, 513} {
+				seedReclaimMeta(t, m, id, keyspacepb.KeyspaceState_TOMBSTONE)
+			}
+			cluster.PutRegion(reclaimRegion(511, 513))
+			r := m.reuse.Load()
+			ok, err := m.RequestKeyspaceReclaim(m.ctx, 512)
+			require.NoError(t, err)
+			require.True(t, ok)
+			ok, err = m.RequestKeyspaceReclaim(m.ctx, 511)
+			require.NoError(t, err)
+			require.False(t, ok)
+			if invalid {
+				r.bitmap.mu.Lock()
+				r.bitmap.invalidateBucketLocked(0)
+				r.bitmap.mu.Unlock()
+			}
+			// Claim 512 without loading or repairing the preceding bucket.
+			meta, err := m.claimFreeKeyspace(r, "first", nil, 10)
+			require.NoError(t, err)
+			require.NotNil(t, meta)
+			require.Equal(t, uint32(512), meta.GetId())
+			r.bitmap.mu.Lock()
+			defer r.bitmap.mu.Unlock()
+			require.Zero(t, r.bitmap.nextLoad)
+			require.NotContains(t, r.bitmap.buckets, uint32(0))
+		})
 	}
-	cluster.PutRegion(reclaimRegion(511, 513))
-	r := m.reuse.Load()
-	ok, err := m.RequestKeyspaceReclaim(m.ctx, 512)
-	require.NoError(t, err)
-	require.True(t, ok)
-	// An unknown preceding bucket blocks reuse until its contents are loaded.
-	meta, err := m.claimFreeKeyspace(r, "too-early", nil, 10)
-	require.NoError(t, err)
-	require.Nil(t, meta)
-	ok, err = m.RequestKeyspaceReclaim(m.ctx, 511)
-	require.NoError(t, err)
-	require.True(t, ok)
-	meta, err = m.claimFreeKeyspaceID(r, 512, "out-of-order", nil, 10)
-	require.NoError(t, err)
-	require.Nil(t, meta)
-	meta, err = m.claimFreeKeyspace(r, "first", nil, 10)
-	require.NoError(t, err)
-	require.Equal(t, uint32(511), meta.GetId())
-	meta, err = m.claimFreeKeyspace(r, "second", nil, 10)
-	require.NoError(t, err)
-	require.Equal(t, uint32(512), meta.GetId())
 }
 
 func TestIDReuseConcurrentClaimsAndLostReply(t *testing.T) {
