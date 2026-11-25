@@ -80,7 +80,8 @@ type freeIDBitmapStore interface {
 // share a bucket; a 64-byte bucket covers 512 IDs. Only IDs whose reclamation
 // has completed belong in this index.
 //
-// The last ID in each bucket is never reclaimed. Keeping this bit unavailable
+// The last ID in each bucket is intentionally left unreclaimed to simplify
+// the implementation. Keeping this bit unavailable
 // breaks free runs at bucket boundaries, so selection and claiming depend only
 // on the current bucket. This costs one reusable ID per bucket (1/512 by default)
 // and lets a single bucket CAS protect the predecessor check, even if a timed-out
