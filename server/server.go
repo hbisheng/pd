@@ -879,10 +879,20 @@ func (s *Server) createRaftCluster() error {
 		return nil
 	}
 
-	return s.cluster.Start(s, false)
+	if err := s.cluster.Start(s, false); err != nil {
+		return err
+	}
+	if err := s.keyspaceManager.StartFreeIDService(kv.NewEtcdKVBase(s.client), s.member.GetElectionPath(), s.member.MemberValue()); err != nil {
+		s.cluster.Stop()
+		return err
+	}
+	return nil
 }
 
 func (s *Server) stopRaftCluster() {
+	if s.keyspaceManager != nil {
+		s.keyspaceManager.StopFreeIDService()
+	}
 	failpoint.Inject("raftclusterIsBusy", func() {})
 	s.cluster.Stop()
 }
@@ -1253,6 +1263,10 @@ func (s *Server) UpdateKeyspaceConfig(newCfg *config.KeyspaceConfig) {
 }
 
 func (s *Server) setKeyspaceConfigInner(oldCfg, newCfg *config.KeyspaceConfig, updateKeyspaceManager bool) error {
+	if oldCfg.EnableIDReclaim != newCfg.EnableIDReclaim || newCfg.EnableIDReclaim &&
+		oldCfg.GetIDReclaimRateLimit() != newCfg.GetIDReclaimRateLimit() {
+		return errors.New("keyspace ID reclamation settings require restarting PD")
+	}
 	if err := newCfg.Validate(); err != nil {
 		return err
 	}
@@ -2252,7 +2266,13 @@ func (s *Server) loadKeyspaceConfig() {
 	if s.keyspaceManager == nil {
 		return
 	}
-	cfg := s.persistOptions.GetKeyspaceConfig()
+	cfg := s.persistOptions.GetKeyspaceConfig().Clone()
+	// Reclamation is a startup-only opt-in. Persisted settings from an earlier run
+	// must not override the operator's current startup configuration.
+	startup := &s.cfg.Keyspace
+	cfg.EnableIDReclaim = startup.EnableIDReclaim
+	cfg.IDReclaimRateLimit = startup.IDReclaimRateLimit
+	s.persistOptions.SetKeyspaceConfig(cfg)
 	s.keyspaceManager.UpdateConfig(cfg)
 }
 

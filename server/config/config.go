@@ -255,6 +255,7 @@ const (
 
 	defaultWaitRegionSplitTimeout   = 30 * time.Second
 	defaultCheckRegionSplitInterval = 50 * time.Millisecond
+	defaultIDReclaimRateLimit       = 100
 	minCheckRegionSplitInterval     = 1 * time.Millisecond
 	maxCheckRegionSplitInterval     = 100 * time.Millisecond
 
@@ -920,6 +921,12 @@ type KeyspaceConfig struct {
 	WaitRegionSplitTimeout typeutil.Duration `toml:"wait-region-split-timeout" json:"wait-region-split-timeout"`
 	// CheckRegionSplitInterval indicates the interval to check whether the region split is complete
 	CheckRegionSplitInterval typeutil.Duration `toml:"check-region-split-interval" json:"check-region-split-interval"`
+	// EnableIDReclaim allows external requests to reclaim deleted keyspace IDs.
+	// It does not enable reuse during Create. Changes require a PD restart.
+	EnableIDReclaim bool `toml:"enable-id-reclaim" json:"enable-id-reclaim"`
+	// IDReclaimRateLimit limits reclamation attempts per second, including deferred
+	// and failed requests. It must be positive when reclamation is enabled.
+	IDReclaimRateLimit int `toml:"id-reclaim-rate-limit" json:"id-reclaim-rate-limit"`
 	// MetaServiceGroups is the available external meta-service groups.
 	// The key is the meta-service group name, and the value is the corresponding endpoint.
 	MetaServiceGroups map[string]string `toml:"meta-service-groups" json:"meta-service-groups"`
@@ -927,6 +934,9 @@ type KeyspaceConfig struct {
 
 // Validate checks if keyspace config falls within acceptable range.
 func (c *KeyspaceConfig) Validate() error {
+	if c.EnableIDReclaim && c.IDReclaimRateLimit <= 0 {
+		return errors.New("ID reclaim rate limit must be positive")
+	}
 	if c.CheckRegionSplitInterval.Duration > maxCheckRegionSplitInterval || c.CheckRegionSplitInterval.Duration < minCheckRegionSplitInterval {
 		return errors.New(fmt.Sprintf("[keyspace] check-region-split-interval should between %v and %v",
 			minCheckRegionSplitInterval, maxCheckRegionSplitInterval))
@@ -946,6 +956,10 @@ func (c *KeyspaceConfig) adjust(meta *configutil.ConfigMetaData) error {
 	}
 	if !meta.IsDefined("check-region-split-interval") {
 		c.CheckRegionSplitInterval = typeutil.NewDuration(defaultCheckRegionSplitInterval)
+	}
+
+	if !meta.IsDefined("id-reclaim-rate-limit") {
+		configutil.AdjustInt(&c.IDReclaimRateLimit, defaultIDReclaimRateLimit)
 	}
 
 	return AdjustMetaServiceGroups(c.MetaServiceGroups)
@@ -1032,4 +1046,14 @@ func (c *KeyspaceConfig) GetMetaServiceGroups() map[string]string {
 // SetMetaServiceGroups updates the current meta-service-group configuration.
 func (c *KeyspaceConfig) SetMetaServiceGroups(metaServiceGroups map[string]string) {
 	c.MetaServiceGroups = metaServiceGroups
+}
+
+// IsIDReclaimEnabled reports whether deleted-keyspace ID reclamation is enabled.
+func (c *KeyspaceConfig) IsIDReclaimEnabled() bool {
+	return c.EnableIDReclaim
+}
+
+// GetIDReclaimRateLimit returns the maximum sustained reclamation attempts per second.
+func (c *KeyspaceConfig) GetIDReclaimRateLimit() int {
+	return c.IDReclaimRateLimit
 }

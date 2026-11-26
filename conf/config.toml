@@ -222,3 +222,11 @@
 ## Example:
 ## pre-alloc = ["admin", "user1", "user2"]
 # pre-alloc = []
+
+## ID reclamation is experimental and disabled by default. Create continues
+## using increasing IDs. Enable only after TiKV merge cleanup is deployed.
+## These settings require a PD restart; disabled reclamation performs no bitmap IO.
+# enable-id-reclaim = false
+## Maximum sustained reclamation attempts per second (positive when enabled).
+## Deferred and failed attempts also count toward the limit.
+# id-reclaim-rate-limit = 100

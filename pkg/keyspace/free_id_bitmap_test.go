@@ -38,6 +38,7 @@ type bitmapTestStore struct {
 	loseReply     bool
 	delayCommit   bool
 	pendingCommit func() error
+	afterCommit   func()
 	afterRead     func()
 	lastRead      []kv.RawTxnOp
 }
@@ -85,6 +86,9 @@ func (s *bitmapTestStore) RunInTxnWithConditions(ctx context.Context, conditions
 		})
 	}
 	err := s.freeIDBitmapStore.RunInTxnWithConditions(ctx, conditions, f)
+	if err == nil && s.afterCommit != nil {
+		s.afterCommit()
+	}
 	if err == nil && s.loseReply {
 		return errors.New("injected lost commit response")
 	}
