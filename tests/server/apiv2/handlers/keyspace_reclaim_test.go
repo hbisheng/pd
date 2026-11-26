@@ -40,8 +40,7 @@ func TestKeyspaceReclaimAPI(t *testing.T) {
 		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
 			ctx := t.Context()
 			cluster, err := tests.NewTestCluster(ctx, 1, func(cfg *config.Config, _ string) {
-				cfg.Keyspace.EnableIDReuse = enabled
-				cfg.Keyspace.IDReuseThreshold = 1
+				cfg.Keyspace.EnableIDReclaim = enabled
 				cfg.PDServerCfg.KeyType = "txn"
 			})
 			require.NoError(t, err)

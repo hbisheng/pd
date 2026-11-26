@@ -16,33 +16,32 @@ package config
 
 import (
 	"testing"
-	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/stretchr/testify/require"
-
-	"github.com/tikv/pd/pkg/utils/typeutil"
 )
 
-func TestKeyspaceIDReuseConfiguration(t *testing.T) {
+func TestKeyspaceIDReclaimConfiguration(t *testing.T) {
 	cfg := NewConfig()
 	require.NoError(t, cfg.Adjust(nil, false))
 	c := cfg.Keyspace
+	require.False(t, c.IsIDReclaimEnabled())
 	require.False(t, c.IsIDReuseEnabled())
 	require.False(t, c.IsEncryptedIDReuseEnabled())
-	require.Equal(t, uint64(1_000_000), c.GetIDReuseThreshold())
-	require.Equal(t, 64, c.GetIDReuseBucketBytes())
-	require.Equal(t, 64, c.GetIDReuseLoadPageBuckets())
-	require.Equal(t, 100*time.Millisecond, c.GetIDReuseLoadInterval())
-	require.Equal(t, 10*time.Millisecond, c.GetIDReuseReclaimInterval())
-	for _, update := range []func(*KeyspaceConfig){
-		func(c *KeyspaceConfig) { c.IDReuseBucketBytes = 63 },
-		func(c *KeyspaceConfig) { c.IDReuseBucketBytes = 8192 },
-		func(c *KeyspaceConfig) { c.IDReuseLoadPageBuckets = 257 },
-		func(c *KeyspaceConfig) { c.IDReuseLoadInterval = typeutil.NewDuration(-time.Second) },
-		func(c *KeyspaceConfig) { c.IDReuseReclaimInterval = typeutil.NewDuration(-time.Second) },
-	} {
+	require.Equal(t, 100, c.GetIDReclaimRateLimit())
+	for _, limit := range []int{0, -1} {
 		copy := c.Clone()
-		update(copy)
-		require.Error(t, copy.Validate())
+		copy.IDReclaimRateLimit = limit
+		copy.EnableIDReuse = true
+		require.NoError(t, copy.Validate(), "disabled reclamation must ignore its inactive settings")
+		copy.EnableIDReclaim = true
+		require.ErrorContains(t, copy.Validate(), "rate limit must be positive")
 	}
+
+	// Explicit rates are requests per second and survive configuration adjustment.
+	meta, err := toml.Decode("[keyspace]\nenable-id-reclaim = true\nid-reclaim-rate-limit = 37", cfg)
+	require.NoError(t, err)
+	require.NoError(t, cfg.Adjust(&meta, false))
+	require.NoError(t, cfg.Keyspace.Validate())
+	require.Equal(t, 37, cfg.Keyspace.GetIDReclaimRateLimit())
 }

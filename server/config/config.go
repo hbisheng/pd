@@ -255,6 +255,7 @@ const (
 
 	defaultWaitRegionSplitTimeout   = 30 * time.Second
 	defaultCheckRegionSplitInterval = 50 * time.Millisecond
+	defaultIDReclaimRateLimit       = 100
 	minCheckRegionSplitInterval     = 1 * time.Millisecond
 	maxCheckRegionSplitInterval     = 100 * time.Millisecond
 
@@ -920,21 +921,17 @@ type KeyspaceConfig struct {
 	WaitRegionSplitTimeout typeutil.Duration `toml:"wait-region-split-timeout" json:"wait-region-split-timeout"`
 	// CheckRegionSplitInterval indicates the interval to check whether the region split is complete
 	CheckRegionSplitInterval typeutil.Duration `toml:"check-region-split-interval" json:"check-region-split-interval"`
-	// EnableIDReuse enables the experimental deleted-keyspace ID reuse path.
+	// EnableIDReclaim allows external requests to reclaim deleted keyspace IDs.
+	// It does not enable reuse during Create. Changes require a PD restart.
+	EnableIDReclaim bool `toml:"enable-id-reclaim" json:"enable-id-reclaim"`
+	// EnableIDReuse lets Create claim previously reclaimed IDs. Reclamation can
+	// remain disabled while this consumes the existing pool. Requires a restart.
 	EnableIDReuse bool `toml:"enable-id-reuse" json:"enable-id-reuse"`
-	// EnableEncryptedIDReuse is a legacy-encryption reuse; defaults to plaintext reuse.
+	// EnableEncryptedIDReuse allows legacy-encrypted reuse when ID reuse is enabled.
 	EnableEncryptedIDReuse bool `toml:"enable-encrypted-id-reuse" json:"enable-encrypted-id-reuse"`
-	// IDReuseBucketBytes selects the persisted bitmap layout, immutable once installed.
-	IDReuseBucketBytes int `toml:"id-reuse-bucket-bytes" json:"id-reuse-bucket-bytes"`
-	// IDReuseLoadPageBuckets bounds the numeric bucket interval of each cache read.
-	IDReuseLoadPageBuckets int `toml:"id-reuse-load-page-buckets" json:"id-reuse-load-page-buckets"`
-	// IDReuseLoadInterval paces background cache reads, including empty intervals.
-	IDReuseLoadInterval typeutil.Duration `toml:"id-reuse-load-interval" json:"id-reuse-load-interval"`
-	// IDReuseReclaimInterval limits reclamation requests accepted by this leader.
-	IDReuseReclaimInterval typeutil.Duration `toml:"id-reuse-reclaim-interval" json:"id-reuse-reclaim-interval"`
-	// IDReuseThreshold is the minimum reserved allocator-window end at which
-	// new reclamation requests are admitted.
-	IDReuseThreshold uint64 `toml:"id-reuse-threshold" json:"id-reuse-threshold"`
+	// IDReclaimRateLimit limits reclamation attempts per second, including deferred
+	// and failed requests. It must be positive when reclamation is enabled.
+	IDReclaimRateLimit int `toml:"id-reclaim-rate-limit" json:"id-reclaim-rate-limit"`
 	// MetaServiceGroups is the available external meta-service groups.
 	// The key is the meta-service group name, and the value is the corresponding endpoint.
 	MetaServiceGroups map[string]string `toml:"meta-service-groups" json:"meta-service-groups"`
@@ -942,14 +939,8 @@ type KeyspaceConfig struct {
 
 // Validate checks if keyspace config falls within acceptable range.
 func (c *KeyspaceConfig) Validate() error {
-	if n := c.GetIDReuseLoadPageBuckets(); n < 1 || n > 256 {
-		return errors.New("ID reuse load page must cover between 1 and 256 buckets")
-	}
-	if c.GetIDReuseLoadInterval() <= 0 || c.GetIDReuseReclaimInterval() <= 0 {
-		return errors.New("ID reuse load and reclaim intervals must be positive")
-	}
-	if n := c.GetIDReuseBucketBytes(); n < 1 || n > 4096 || n&(n-1) != 0 {
-		return errors.New("bitmap bucket bytes must be a power of two between 1 and 4096")
+	if c.EnableIDReclaim && c.IDReclaimRateLimit <= 0 {
+		return errors.New("ID reclaim rate limit must be positive")
 	}
 	if c.CheckRegionSplitInterval.Duration > maxCheckRegionSplitInterval || c.CheckRegionSplitInterval.Duration < minCheckRegionSplitInterval {
 		return errors.New(fmt.Sprintf("[keyspace] check-region-split-interval should between %v and %v",
@@ -972,9 +963,10 @@ func (c *KeyspaceConfig) adjust(meta *configutil.ConfigMetaData) error {
 		c.CheckRegionSplitInterval = typeutil.NewDuration(defaultCheckRegionSplitInterval)
 	}
 
-	if !meta.IsDefined("id-reuse-threshold") {
-		c.IDReuseThreshold = 1_000_000
+	if !meta.IsDefined("id-reclaim-rate-limit") {
+		configutil.AdjustInt(&c.IDReclaimRateLimit, defaultIDReclaimRateLimit)
 	}
+
 	return AdjustMetaServiceGroups(c.MetaServiceGroups)
 }
 
@@ -1061,47 +1053,18 @@ func (c *KeyspaceConfig) SetMetaServiceGroups(metaServiceGroups map[string]strin
 	c.MetaServiceGroups = metaServiceGroups
 }
 
-// IsIDReuseEnabled reports whether deleted-keyspace ID reuse is enabled.
-func (c *KeyspaceConfig) IsIDReuseEnabled() bool {
-	return c.EnableIDReuse
+// IsIDReclaimEnabled reports whether deleted-keyspace ID reclamation is enabled.
+func (c *KeyspaceConfig) IsIDReclaimEnabled() bool {
+	return c.EnableIDReclaim
 }
 
-// GetIDReuseThreshold returns the allocator reserved-window admission threshold.
-func (c *KeyspaceConfig) GetIDReuseThreshold() uint64 {
-	return c.IDReuseThreshold
+// GetIDReclaimRateLimit returns the maximum sustained reclamation attempts per second.
+func (c *KeyspaceConfig) GetIDReclaimRateLimit() int {
+	return c.IDReclaimRateLimit
 }
 
-// GetIDReuseBucketBytes returns the experimental bucket width.
-func (c *KeyspaceConfig) GetIDReuseBucketBytes() int {
-	if c.IDReuseBucketBytes == 0 {
-		return 64
-	}
-	return c.IDReuseBucketBytes
-}
+// IsIDReuseEnabled reports whether Create may consume reclaimed IDs.
+func (c *KeyspaceConfig) IsIDReuseEnabled() bool { return c.EnableIDReuse }
 
-// GetIDReuseLoadPageBuckets returns the maximum buckets in one background read.
-func (c *KeyspaceConfig) GetIDReuseLoadPageBuckets() int {
-	if c.IDReuseLoadPageBuckets == 0 {
-		return 64
-	}
-	return c.IDReuseLoadPageBuckets
-}
-
-// GetIDReuseLoadInterval returns the delay between background cache reads.
-func (c *KeyspaceConfig) GetIDReuseLoadInterval() time.Duration {
-	if c.IDReuseLoadInterval.Duration == 0 {
-		return 100 * time.Millisecond
-	}
-	return c.IDReuseLoadInterval.Duration
-}
-
-// GetIDReuseReclaimInterval returns the minimum spacing between reclaim requests.
-func (c *KeyspaceConfig) GetIDReuseReclaimInterval() time.Duration {
-	if c.IDReuseReclaimInterval.Duration == 0 {
-		return 10 * time.Millisecond
-	}
-	return c.IDReuseReclaimInterval.Duration
-}
-
-// IsEncryptedIDReuseEnabled enables legacy encryption reuse when explicitly configured.
+// IsEncryptedIDReuseEnabled reports whether legacy-encrypted reuse is allowed.
 func (c *KeyspaceConfig) IsEncryptedIDReuseEnabled() bool { return c.EnableEncryptedIDReuse }

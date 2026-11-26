@@ -114,8 +114,8 @@ type Manager struct {
 	keyspaceStateLookup  sync.Map // store as ID(uint32) -> state(keyspacepb.KeyspaceState)
 	cache                *Cache
 	gcBarrierInvalidator atomic.Pointer[func(uint32)]
-	reuse                atomic.Pointer[idReuse]
-	reuseLifecycleMu     sync.Mutex
+	freeIDs              atomic.Pointer[freeIDService]
+	freeIDLifecycleMu    sync.Mutex
 }
 
 // SetGCBarrierInvalidator installs the GC observation lifecycle callback.
@@ -278,7 +278,7 @@ func (manager *Manager) CreateKeyspace(request *CreateKeyspaceRequest) (*keyspac
 	if err := validateName(request.Name); err != nil {
 		return nil, err
 	}
-	if r := manager.reuse.Load(); r != nil {
+	if r := manager.freeIDs.Load(); r != nil && r.reuseEnabled {
 		meta, err := manager.createReusedKeyspace(r, request, tracer)
 		if err != nil || meta != nil {
 			return meta, err

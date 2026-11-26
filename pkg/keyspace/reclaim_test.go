@@ -290,7 +290,7 @@ func TestReclaimRemovesTSOMembershipAtomically(t *testing.T) {
 			store.loseReply = tc.loseReply
 			if tc.conflict {
 				// Reject the final commit after all three changes have been staged.
-				b.store = &reuseLeaderStore{freeIDBitmapStore: store, leaderKey: reuseTestLeaderKey, leaderValue: "old-leader"}
+				b.store = &freeIDLeaderStore{freeIDBitmapStore: store, leaderKey: reclaimTestLeaderKey, leaderValue: "old-leader"}
 			}
 			ctx, cancel := context.WithCancel(m.ctx)
 			defer cancel()

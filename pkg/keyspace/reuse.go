@@ -32,6 +32,11 @@ import (
 	"github.com/tikv/pd/pkg/versioninfo/kerneltype"
 )
 
+// canReuseIDs rejects a stopped or replaced service before claiming an ID.
+func (manager *Manager) canReuseIDs(service *freeIDService) bool {
+	return service.reuseEnabled && manager.freeIDs.Load() == service && service.ctx.Err() == nil
+}
+
 func supportsReuseEncryption(config map[string]string, enabled bool) bool {
 	if config["encryption"] == "" {
 		return true
@@ -49,8 +54,8 @@ func supportsReuseEncryption(config map[string]string, enabled bool) bool {
 
 // createReusedKeyspace is entered only while the explicitly enabled service is
 // active. Returning nil, nil leaves the ordinary Create path untouched.
-func (manager *Manager) createReusedKeyspace(r *idReuse, request *CreateKeyspaceRequest, tracer *createKeyspaceTracer) (*keyspacepb.KeyspaceMeta, error) {
-	if !manager.reuseAdmitted(r) || !manager.transactionalReuseConfig(request.Config) || !supportsReuseEncryption(request.Config, r.encrypted) {
+func (manager *Manager) createReusedKeyspace(r *freeIDService, request *CreateKeyspaceRequest, tracer *createKeyspaceTracer) (*keyspacepb.KeyspaceMeta, error) {
+	if !manager.canReuseIDs(r) || !manager.transactionalReuseConfig(request.Config) || !supportsReuseEncryption(request.Config, r.encrypted) {
 		return nil, nil
 	}
 	config := maps.Clone(request.Config)
@@ -102,7 +107,7 @@ func (manager *Manager) createReusedKeyspace(r *idReuse, request *CreateKeyspace
 
 // claimFreeKeyspace is best effort before ownership is persisted. Busy claims,
 // loader reads and reclamation writes leave ordinary allocation available.
-func (manager *Manager) claimFreeKeyspace(r *idReuse, name string, config map[string]string, createdAt int64) (*keyspacepb.KeyspaceMeta, error) {
+func (manager *Manager) claimFreeKeyspace(r *freeIDService, name string, config map[string]string, createdAt int64) (*keyspacepb.KeyspaceMeta, error) {
 	if !r.claimMu.TryLock() {
 		return nil, nil
 	}
@@ -129,7 +134,7 @@ func (manager *Manager) claimFreeKeyspace(r *idReuse, name string, config map[st
 	}
 }
 
-func (manager *Manager) claimFreeKeyspaceID(r *idReuse, id uint32, name string, config map[string]string, createdAt int64) (*keyspacepb.KeyspaceMeta, error) {
+func (manager *Manager) claimFreeKeyspaceID(r *freeIDService, id uint32, name string, config map[string]string, createdAt int64) (*keyspacepb.KeyspaceMeta, error) {
 	if manager.mgm != nil {
 		manager.mgm.RLock()
 		defer manager.mgm.RUnlock()
@@ -142,7 +147,7 @@ func (manager *Manager) claimFreeKeyspaceID(r *idReuse, id uint32, name string, 
 	}
 	defer b.mu.Unlock()
 	region := manager.coveringKeyspaceRegion(id)
-	if !manager.reuseAdmitted(r) || region == nil || !reusableKeyspaceID(id+1) || !regionCoversKeyspace(region.GetMeta(), MakeRegionBound(id+1)) {
+	if !manager.canReuseIDs(r) || region == nil || !reusableKeyspaceID(id+1) || !regionCoversKeyspace(region.GetMeta(), MakeRegionBound(id+1)) {
 		return nil, nil
 	}
 	// Lookup releases the lock. Recheck both bits before the bucket CAS.
@@ -204,7 +209,7 @@ func sameReusedKeyspace(current, expected *keyspacepb.KeyspaceMeta) bool {
 	return current != nil && current.Name == expected.Name && current.CreatedAt == expected.CreatedAt && maps.Equal(current.Config, expected.Config)
 }
 
-func (manager *Manager) initializeReusedKeyspace(r *idReuse, meta *keyspacepb.KeyspaceMeta) error {
+func (manager *Manager) initializeReusedKeyspace(r *freeIDService, meta *keyspacepb.KeyspaceMeta) error {
 	// Install the ordinary split rule only for the same still-disabled owner.
 	err := func() error {
 		manager.metaLock.Lock(meta.GetId())
@@ -245,7 +250,7 @@ func (manager *Manager) initializeReusedKeyspace(r *idReuse, meta *keyspacepb.Ke
 
 // finishReusedKeyspace verifies the claimed owner in the final transaction.
 // Cancellation never puts the ID back into the bitmap while a split is in flight.
-func (manager *Manager) finishReusedKeyspace(r *idReuse, expected *keyspacepb.KeyspaceMeta, state keyspacepb.KeyspaceState) error {
+func (manager *Manager) finishReusedKeyspace(r *freeIDService, expected *keyspacepb.KeyspaceMeta, state keyspacepb.KeyspaceState) error {
 	// Match config updates: exclude bulk removal before taking the metadata
 	// lock, because removal takes the group lock before inspecting metadata.
 	if manager.kgm != nil {

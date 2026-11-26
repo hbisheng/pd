@@ -38,11 +38,12 @@ import (
 func newReuseFixture(t *testing.T, encrypted bool) (*Manager, *mockcluster.Cluster, kv.Base) {
 	t.Helper()
 	m, cluster, backend := newReclaimServiceFixture(t)
-	if encrypted {
-		m.StopIDReuse()
-		m.config.(*config.KeyspaceConfig).EnableEncryptedIDReuse = true
-		require.NoError(t, m.StartIDReuse(backend, reuseTestLeaderKey, "leader"))
-	}
+	m.StopFreeIDService()
+	cfg := m.config.(*config.KeyspaceConfig)
+	cfg.EnableIDReuse = true
+	cfg.EnableEncryptedIDReuse = encrypted
+	require.NoError(t, m.StartFreeIDService(backend, reclaimTestLeaderKey, "leader"))
+
 	return m, cluster, backend
 }
 
@@ -78,7 +79,7 @@ func TestIDReuseCreateUsesExistingSplit(t *testing.T) {
 			cluster.PutRegion(reclaimRegion(42, 42))
 			cluster.PutRegion(reclaimRegion(43, 43))
 			require.NoError(t, <-finished)
-			_, free := m.reuse.Load().bitmap.candidates().Next()
+			_, free := m.freeIDs.Load().bitmap.candidates().Next()
 			require.False(t, free)
 			name, err := m.GetKeyspaceNameByID(42)
 			require.NoError(t, err)
@@ -111,7 +112,7 @@ func TestIDReuseTimeoutAndCancellation(t *testing.T) {
 			meta, _, err := m.store.LoadKeyspaceMetaWithRevision(m.ctx, 42)
 			require.NoError(t, err)
 			require.Equal(t, keyspacepb.KeyspaceState_ARCHIVED, meta.State)
-			_, free := m.reuse.Load().bitmap.candidates().Next()
+			_, free := m.freeIDs.Load().bitmap.candidates().Next()
 			require.False(t, free)
 		})
 	}
@@ -126,7 +127,7 @@ func TestIDReuseSkipsUnreclaimedLowerID(t *testing.T) {
 	ok, err := m.RequestKeyspaceReclaim(m.ctx, 101)
 	require.NoError(t, err)
 	require.True(t, ok)
-	meta, err := m.claimFreeKeyspace(m.reuse.Load(), "new-101", nil, 10)
+	meta, err := m.claimFreeKeyspace(m.freeIDs.Load(), "new-101", nil, 10)
 	require.NoError(t, err)
 	require.Equal(t, uint32(101), meta.GetId())
 }
@@ -139,7 +140,7 @@ func TestIDReuseBucketStartIgnoresNeighborCache(t *testing.T) {
 				seedReclaimMeta(t, m, id, keyspacepb.KeyspaceState_TOMBSTONE)
 			}
 			cluster.PutRegion(reclaimRegion(511, 513))
-			r := m.reuse.Load()
+			r := m.freeIDs.Load()
 			ok, err := m.RequestKeyspaceReclaim(m.ctx, 512)
 			require.NoError(t, err)
 			require.True(t, ok)
@@ -167,7 +168,7 @@ func TestIDReuseBucketStartIgnoresNeighborCache(t *testing.T) {
 func TestIDReuseConcurrentClaimsAndLostReply(t *testing.T) {
 	m, cluster, _ := newReuseFixture(t, false)
 	reclaimForReuse(t, m, cluster)
-	r := m.reuse.Load()
+	r := m.freeIDs.Load()
 	wrapped := &bitmapTestStore{freeIDBitmapStore: r.store.freeIDBitmapStore, loseReply: true}
 	r.store.freeIDBitmapStore = wrapped
 	var wg sync.WaitGroup
@@ -198,15 +199,15 @@ func TestIDReuseConcurrentClaimsAndLostReply(t *testing.T) {
 func TestIDReuseLeaderChangeAndCacheReload(t *testing.T) {
 	m, cluster, backend := newReuseFixture(t, false)
 	reclaimForReuse(t, m, cluster)
-	old := m.reuse.Load()
-	require.NoError(t, backend.Save(reuseTestLeaderKey, "next-leader"))
+	old := m.freeIDs.Load()
+	require.NoError(t, backend.Save(reclaimTestLeaderKey, "next-leader"))
 	meta, err := m.claimFreeKeyspace(old, "stale", nil, 10)
 	require.NoError(t, err)
 	require.Nil(t, meta)
-	m.StopIDReuse()
+	m.StopFreeIDService()
 	require.Error(t, old.ctx.Err())
-	require.NoError(t, m.StartIDReuse(backend, reuseTestLeaderKey, "next-leader"))
-	r := m.reuse.Load()
+	require.NoError(t, m.StartFreeIDService(backend, reclaimTestLeaderKey, "next-leader"))
+	r := m.freeIDs.Load()
 	require.NotSame(t, old, r)
 	require.NoError(t, r.bitmap.loadNextPage(context.Background(), 1))
 	meta, err = m.claimFreeKeyspace(r, "current", nil, 10)
@@ -222,7 +223,7 @@ func TestIDReuseRejectsExactRegionAndExplicitCreate(t *testing.T) {
 	require.ErrorContains(t, err, "must be claimed")
 	cluster.PutRegion(reclaimRegion(42, 42))
 	cluster.PutRegion(reclaimRegion(43, 43))
-	meta, err := m.claimFreeKeyspace(m.reuse.Load(), "exact", nil, 10)
+	meta, err := m.claimFreeKeyspace(m.freeIDs.Load(), "exact", nil, 10)
 	require.NoError(t, err)
 	require.Nil(t, meta)
 }
@@ -243,7 +244,7 @@ func TestIDReuseEncryptionAdmission(t *testing.T) {
 func TestIDReuseCancellationBeforeRuleInstallation(t *testing.T) {
 	m, cluster, _ := newReuseFixture(t, false)
 	reclaimForReuse(t, m, cluster)
-	r := m.reuse.Load()
+	r := m.freeIDs.Load()
 	meta, err := m.claimFreeKeyspace(r, "cancelled", nil, 10)
 	require.NoError(t, err)
 	require.NotNil(t, meta)
@@ -258,7 +259,7 @@ func TestIDReuseCancelledFinishDoesNotAssignTSOGroup(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			m, cluster, backend := newReuseFixture(t, false)
 			reclaimForReuse(t, m, cluster)
-			r := m.reuse.Load()
+			r := m.freeIDs.Load()
 			meta, err := m.claimFreeKeyspace(r, "cancelled", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 10)
 			require.NoError(t, err)
 			group, err := m.kgm.GetKeyspaceGroupByID(0)
@@ -269,9 +270,9 @@ func TestIDReuseCancelledFinishDoesNotAssignTSOGroup(t *testing.T) {
 				_, err = m.UpdateKeyspaceState("cancelled", keyspacepb.KeyspaceState_ARCHIVED, 11)
 				require.NoError(t, err)
 			case "leader-stop":
-				m.StopIDReuse()
+				m.StopFreeIDService()
 			default:
-				require.NoError(t, backend.Save(reuseTestLeaderKey, "next-leader"))
+				require.NoError(t, backend.Save(reclaimTestLeaderKey, "next-leader"))
 			}
 			require.Error(t, m.finishReusedKeyspace(r, meta, keyspacepb.KeyspaceState_ENABLED))
 			group, err = m.kgm.GetKeyspaceGroupByID(0)
@@ -341,8 +342,8 @@ func TestIDReuseFallbackPreservesFreeID(t *testing.T) {
 			reclaimForReuse(t, m, cluster)
 			config := map[string]string{"encryption": `{"enabled":true,"cmek_id":"customer"}`}
 			if mode == "cold-cache" {
-				m.StopIDReuse()
-				require.NoError(t, m.StartIDReuse(backend, reuseTestLeaderKey, "leader"))
+				m.StopFreeIDService()
+				require.NoError(t, m.StartFreeIDService(backend, reclaimTestLeaderKey, "leader"))
 				config = nil
 			}
 			require.NoError(t, failpoint.Enable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion", "return(true)"))
@@ -350,7 +351,7 @@ func TestIDReuseFallbackPreservesFreeID(t *testing.T) {
 			meta, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: "ordinary-fallback", Config: config, CreateTime: 10})
 			require.NoError(t, err)
 			require.Equal(t, uint32(1), meta.GetId())
-			bitmap := m.reuse.Load().bitmap
+			bitmap := m.freeIDs.Load().bitmap
 			require.NoError(t, bitmap.loadNextPage(m.ctx, 1))
 			id, ok := bitmap.candidates().Next()
 			require.True(t, ok)
@@ -370,7 +371,7 @@ func TestIDReuseSameNameClaimsPreserveOtherFreeID(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, ok)
 	}
-	r := m.reuse.Load()
+	r := m.freeIDs.Load()
 	results := make(chan *keyspacepb.KeyspaceMeta, 2)
 	failures := make(chan error, 2)
 	for range 2 {
@@ -402,13 +403,13 @@ func TestIDReuseInterruptedClaimRemainsOwned(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			m, cluster, backend := newReuseFixture(t, false)
 			reclaimForReuse(t, m, cluster)
-			r := m.reuse.Load()
+			r := m.freeIDs.Load()
 			meta, err := m.claimFreeKeyspace(r, "unfinished", nil, 10)
 			require.NoError(t, err)
 			if mode == "restart" {
-				m.StopIDReuse()
-				require.NoError(t, m.StartIDReuse(backend, reuseTestLeaderKey, "leader"))
-				r = m.reuse.Load()
+				m.StopFreeIDService()
+				require.NoError(t, m.StartFreeIDService(backend, reclaimTestLeaderKey, "leader"))
+				r = m.freeIDs.Load()
 			} else {
 				cluster.PutRegion(reclaimRegion(42, 42))
 				cluster.PutRegion(reclaimRegion(43, 43))
@@ -430,7 +431,7 @@ func TestIDReuseBusyFallsBackWithoutWaiting(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			m, cluster, _ := newReuseFixture(t, false)
 			reclaimForReuse(t, m, cluster)
-			r := m.reuse.Load()
+			r := m.freeIDs.Load()
 			require.NoError(t, failpoint.Enable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion", "return(true)"))
 			t.Cleanup(func() { require.NoError(t, failpoint.Disable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion")) })
 			lock := &r.claimMu
@@ -474,7 +475,7 @@ func TestIDReuseBusyFallsBackWithoutWaiting(t *testing.T) {
 func TestIDReuseSkipsClaimWhenBitmapBecomesBusy(t *testing.T) {
 	m, cluster, _ := newReuseFixture(t, false)
 	reclaimForReuse(t, m, cluster)
-	r := m.reuse.Load()
+	r := m.freeIDs.Load()
 	id, ok := r.bitmap.candidates().Next()
 	require.True(t, ok)
 	// The loader or reclamation may take the lock after candidate selection.
@@ -545,7 +546,7 @@ func TestIDReuseCompletionReconcilesCommitOutcome(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m, cluster, _ := newReuseFixture(t, false)
 			reclaimForReuse(t, m, cluster)
-			r := m.reuse.Load()
+			r := m.freeIDs.Load()
 			meta, err := m.claimFreeKeyspace(r, "new-owner", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 10)
 			require.NoError(t, err)
 			require.NotNil(t, meta)
@@ -557,7 +558,7 @@ func TestIDReuseCompletionReconcilesCommitOutcome(t *testing.T) {
 				fault.cancel = cancel
 			}
 			store.freeIDBitmapStore = fault
-			err = m.finishReusedKeyspace(&idReuse{ctx: ctx, store: &store}, meta, tc.state)
+			err = m.finishReusedKeyspace(&freeIDService{ctx: ctx, store: &store}, meta, tc.state)
 			want := tc.state
 			if tc.abort {
 				require.Error(t, err)
@@ -594,7 +595,7 @@ func TestIDReuseMovesTSOMembershipToNewGroup(t *testing.T) {
 	require.NoError(t, m.kgm.UpdateKeyspaceForGroup(endpoint.Basic, "0", 42, opAdd))
 	reclaimForReuse(t, m, cluster)
 	require.NoError(t, m.kgm.CreateKeyspaceGroups([]*endpoint.KeyspaceGroup{{ID: 1, UserKind: "basic"}}))
-	r := m.reuse.Load()
+	r := m.freeIDs.Load()
 	meta, err := m.claimFreeKeyspace(r, "new-owner", map[string]string{TSOKeyspaceGroupIDKey: "1", UserKindKey: "basic"}, 10)
 	require.NoError(t, err)
 	require.NotNil(t, meta)
@@ -613,7 +614,7 @@ func TestIDReuseMovesTSOMembershipToNewGroup(t *testing.T) {
 func TestIDReuseCancellationRefreshesCommittedCompletion(t *testing.T) {
 	m, cluster, _ := newReuseFixture(t, false)
 	reclaimForReuse(t, m, cluster)
-	r := m.reuse.Load()
+	r := m.freeIDs.Load()
 	meta, err := m.claimFreeKeyspace(r, "late-completion", map[string]string{TSOKeyspaceGroupIDKey: "0", UserKindKey: "basic"}, 10)
 	require.NoError(t, err)
 	// Model a completion that commits after readback, before cancellation.
@@ -643,4 +644,75 @@ func TestIDReuseCancellationRefreshesCommittedCompletion(t *testing.T) {
 	group, err := m.kgm.GetGroupByKeyspaceID(42)
 	require.NoError(t, err)
 	require.Zero(t, group)
+}
+
+// Reclamation can accumulate IDs before Create starts consuming them. After a
+// restart, reuse can also consume that pool with new reclamation disabled.
+func TestIDReclaimAndReuseSwitchesAreIndependent(t *testing.T) {
+	for _, reclaim := range []bool{false, true} {
+		for _, reuse := range []bool{false, true} {
+			t.Run(fmt.Sprintf("reclaim=%t/reuse=%t", reclaim, reuse), func(t *testing.T) {
+				m, cluster, backend := newReclaimServiceFixture(t)
+				reclaimForReuse(t, m, cluster)
+				m.StopFreeIDService()
+				cfg := m.config.(*config.KeyspaceConfig)
+				cfg.EnableIDReclaim, cfg.EnableIDReuse = reclaim, reuse
+				if !reclaim {
+					cfg.IDReclaimRateLimit = 0 // Inactive when only reuse is enabled.
+				}
+				require.NoError(t, cfg.Validate())
+				require.NoError(t, m.StartFreeIDService(backend, reclaimTestLeaderKey, "leader"))
+				service := m.freeIDs.Load()
+				if reclaim || reuse {
+					require.NotNil(t, service)
+					require.NoError(t, service.bitmap.loadNextPage(m.ctx, 1))
+				} else {
+					require.Nil(t, service)
+				}
+				for _, id := range []uint32{44, 45} {
+					seedReclaimMeta(t, m, id, keyspacepb.KeyspaceState_TOMBSTONE)
+				}
+				cluster.PutRegion(reclaimRegion(44, 45))
+				reclaimed, err := m.RequestKeyspaceReclaim(m.ctx, 44)
+				if reclaim {
+					require.NoError(t, err)
+					require.True(t, reclaimed)
+				} else {
+					require.ErrorContains(t, err, "disabled")
+					require.False(t, reclaimed)
+					old, _, err := m.store.LoadKeyspaceMetaWithRevision(m.ctx, 44)
+					require.NoError(t, err)
+					require.Equal(t, keyspacepb.KeyspaceState_TOMBSTONE, old.State)
+				}
+				if reuse {
+					result := make(chan *keyspacepb.KeyspaceMeta, 1)
+					failures := make(chan error, 1)
+					go func() {
+						meta, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: "new-owner", CreateTime: 10})
+						result <- meta
+						failures <- err
+					}()
+					waitReuseRule(t, cluster, 42)
+					cluster.PutRegion(reclaimRegion(42, 42))
+					cluster.PutRegion(reclaimRegion(43, 43))
+					require.Equal(t, uint32(42), (<-result).GetId())
+					require.NoError(t, <-failures)
+				} else {
+					require.NoError(t, failpoint.Enable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion", "return(true)"))
+					defer func() { require.NoError(t, failpoint.Disable("github.com/tikv/pd/pkg/keyspace/skipSplitRegion")) }()
+					meta, err := m.CreateKeyspace(&CreateKeyspaceRequest{Name: "new-owner", CreateTime: 10})
+					require.NoError(t, err)
+					require.Equal(t, uint32(1), meta.GetId())
+					// The persistent pool remains available for a later restart.
+					bitmap, err := newFreeIDBitmap(backend.(freeIDBitmapStore), keyspaceFreePrefix(), defaultFreeIDBucketBytes)
+					require.NoError(t, err)
+					require.NoError(t, bitmap.initialize(m.ctx))
+					require.NoError(t, bitmap.loadNextPage(m.ctx, 1))
+					id, ok := bitmap.candidates().Next()
+					require.True(t, ok)
+					require.Equal(t, uint32(42), id)
+				}
+			})
+		}
+	}
 }
