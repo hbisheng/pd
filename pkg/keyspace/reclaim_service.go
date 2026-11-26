@@ -37,8 +37,7 @@ const (
 
 type idReclaimConfig interface {
 	IsIDReclaimEnabled() bool
-	GetFreeIDBucketBytes() int
-	GetIDReclaimInterval() time.Duration
+	GetIDReclaimRateLimit() int
 }
 
 // freeIDService owns the bitmap cache and loader for one PD leadership term.
@@ -83,7 +82,8 @@ func (manager *Manager) StartFreeIDService(backend kv.Base, leaderKey, leaderVal
 		return errors.New("keyspace ID reclamation requires revision-aware storage and a leader identity")
 	}
 	guarded := &freeIDLeaderStore{freeIDBitmapStore: store, leaderKey: leaderKey, leaderValue: leaderValue}
-	bitmap, err := newFreeIDBitmap(guarded, keyspaceFreePrefix(), cfg.GetFreeIDBucketBytes())
+	// Production uses a fixed 64-byte layout; changing it requires a migration.
+	bitmap, err := newFreeIDBitmap(guarded, keyspaceFreePrefix(), defaultFreeIDBucketBytes)
 	if err != nil {
 		return err
 	}
@@ -93,7 +93,7 @@ func (manager *Manager) StartFreeIDService(backend kv.Base, leaderKey, leaderVal
 	ctx, cancel := context.WithCancel(manager.ctx)
 	service := &freeIDService{
 		ctx: ctx, cancel: cancel, done: make(chan struct{}), bitmap: bitmap,
-		limiter: rate.NewLimiter(rate.Every(cfg.GetIDReclaimInterval()), 1),
+		limiter: rate.NewLimiter(rate.Limit(cfg.GetIDReclaimRateLimit()), 1),
 	}
 	manager.freeIDs.Store(service)
 	go func() {
@@ -118,7 +118,8 @@ func (manager *Manager) stopFreeIDServiceLocked() {
 }
 
 // RequestKeyspaceReclaim handles an external reclamation request after checking
-// the startup switch and rate limit. It returns true when the old metadata is
+// the startup switch and rate limit. Every admitted attempt consumes a token,
+// including deferred or failed reclamations. It returns true when the old metadata is
 // removed and the ID is persisted as free; false means the request made no change.
 func (manager *Manager) RequestKeyspaceReclaim(ctx context.Context, id uint32) (bool, error) {
 	service := manager.freeIDs.Load()

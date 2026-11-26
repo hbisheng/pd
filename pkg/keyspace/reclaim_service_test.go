@@ -42,7 +42,7 @@ func newReclaimServiceFixture(t *testing.T) (*Manager, *mockcluster.Cluster, kv.
 	require.NoError(t, m.kgm.Bootstrap(m.ctx))
 	m.config = &config.KeyspaceConfig{
 		EnableIDReclaim:          true,
-		IDReclaimInterval:        typeutil.NewDuration(time.Nanosecond),
+		IDReclaimRateLimit:       100,
 		WaitRegionSplitTimeout:   typeutil.NewDuration(time.Second),
 		CheckRegionSplitInterval: typeutil.NewDuration(time.Millisecond),
 	}

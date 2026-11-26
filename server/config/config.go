@@ -255,6 +255,7 @@ const (
 
 	defaultWaitRegionSplitTimeout   = 30 * time.Second
 	defaultCheckRegionSplitInterval = 50 * time.Millisecond
+	defaultIDReclaimRateLimit       = 100
 	minCheckRegionSplitInterval     = 1 * time.Millisecond
 	maxCheckRegionSplitInterval     = 100 * time.Millisecond
 
@@ -923,10 +924,9 @@ type KeyspaceConfig struct {
 	// EnableIDReclaim allows external requests to reclaim deleted keyspace IDs.
 	// It does not enable reuse during Create. Changes require a PD restart.
 	EnableIDReclaim bool `toml:"enable-id-reclaim" json:"enable-id-reclaim"`
-	// FreeIDBucketBytes selects the persisted bitmap layout, immutable after first use.
-	FreeIDBucketBytes int `toml:"free-id-bucket-bytes" json:"free-id-bucket-bytes"`
-	// IDReclaimInterval sets the minimum spacing between reclamation requests.
-	IDReclaimInterval typeutil.Duration `toml:"id-reclaim-interval" json:"id-reclaim-interval"`
+	// IDReclaimRateLimit limits reclamation attempts per second, including deferred
+	// and failed requests. It must be positive when reclamation is enabled.
+	IDReclaimRateLimit int `toml:"id-reclaim-rate-limit" json:"id-reclaim-rate-limit"`
 	// MetaServiceGroups is the available external meta-service groups.
 	// The key is the meta-service group name, and the value is the corresponding endpoint.
 	MetaServiceGroups map[string]string `toml:"meta-service-groups" json:"meta-service-groups"`
@@ -934,13 +934,8 @@ type KeyspaceConfig struct {
 
 // Validate checks if keyspace config falls within acceptable range.
 func (c *KeyspaceConfig) Validate() error {
-	if c.EnableIDReclaim {
-		if c.GetIDReclaimInterval() <= 0 {
-			return errors.New("ID reclaim interval must be positive")
-		}
-		if n := c.GetFreeIDBucketBytes(); n < 1 || n > 4096 || n&(n-1) != 0 {
-			return errors.New("bitmap bucket bytes must be a power of two between 1 and 4096")
-		}
+	if c.EnableIDReclaim && c.IDReclaimRateLimit <= 0 {
+		return errors.New("ID reclaim rate limit must be positive")
 	}
 	if c.CheckRegionSplitInterval.Duration > maxCheckRegionSplitInterval || c.CheckRegionSplitInterval.Duration < minCheckRegionSplitInterval {
 		return errors.New(fmt.Sprintf("[keyspace] check-region-split-interval should between %v and %v",
@@ -961,6 +956,10 @@ func (c *KeyspaceConfig) adjust(meta *configutil.ConfigMetaData) error {
 	}
 	if !meta.IsDefined("check-region-split-interval") {
 		c.CheckRegionSplitInterval = typeutil.NewDuration(defaultCheckRegionSplitInterval)
+	}
+
+	if !meta.IsDefined("id-reclaim-rate-limit") {
+		configutil.AdjustInt(&c.IDReclaimRateLimit, defaultIDReclaimRateLimit)
 	}
 
 	return AdjustMetaServiceGroups(c.MetaServiceGroups)
@@ -1054,18 +1053,7 @@ func (c *KeyspaceConfig) IsIDReclaimEnabled() bool {
 	return c.EnableIDReclaim
 }
 
-// GetFreeIDBucketBytes returns the persisted bitmap bucket width.
-func (c *KeyspaceConfig) GetFreeIDBucketBytes() int {
-	if c.FreeIDBucketBytes == 0 {
-		return 64
-	}
-	return c.FreeIDBucketBytes
-}
-
-// GetIDReclaimInterval returns the minimum spacing between reclaim requests.
-func (c *KeyspaceConfig) GetIDReclaimInterval() time.Duration {
-	if c.IDReclaimInterval.Duration == 0 {
-		return 10 * time.Millisecond
-	}
-	return c.IDReclaimInterval.Duration
+// GetIDReclaimRateLimit returns the maximum sustained reclamation attempts per second.
+func (c *KeyspaceConfig) GetIDReclaimRateLimit() int {
+	return c.IDReclaimRateLimit
 }

@@ -32,16 +32,21 @@ func TestKeyspaceIDReclaimRequiresStartupConfiguration(t *testing.T) {
 	changed.EnableIDReclaim = true
 	s := &Server{}
 	require.ErrorContains(t, s.setKeyspaceConfigInner(old, changed, false), "restarting PD")
+	active := changed.Clone()
+	changed.IDReclaimRateLimit = 37
+	require.ErrorContains(t, s.setKeyspaceConfigInner(active, changed, false), "restarting PD")
 	// Startup configuration wins over persisted settings from the previous run.
 	s.cfg = cfg
 	s.persistOptions = config.NewPersistOptions(cfg)
 	s.keyspaceManager = keyspace.NewKeyspaceManager(context.Background(), nil, nil, nil, old, nil, nil)
 	for _, enabled := range []bool{true, false} {
 		s.cfg.Keyspace.EnableIDReclaim = enabled
+		s.cfg.Keyspace.IDReclaimRateLimit = 37
 		stale := old.Clone()
 		stale.EnableIDReclaim = !enabled
 		s.persistOptions.SetKeyspaceConfig(stale)
 		s.loadKeyspaceConfig()
 		require.Equal(t, enabled, s.persistOptions.GetKeyspaceConfig().EnableIDReclaim)
+		require.Equal(t, 37, s.persistOptions.GetKeyspaceConfig().IDReclaimRateLimit)
 	}
 }

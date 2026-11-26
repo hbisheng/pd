@@ -1264,7 +1264,7 @@ func (s *Server) UpdateKeyspaceConfig(newCfg *config.KeyspaceConfig) {
 
 func (s *Server) setKeyspaceConfigInner(oldCfg, newCfg *config.KeyspaceConfig, updateKeyspaceManager bool) error {
 	if oldCfg.EnableIDReclaim != newCfg.EnableIDReclaim || newCfg.EnableIDReclaim &&
-		(oldCfg.GetFreeIDBucketBytes() != newCfg.GetFreeIDBucketBytes() || oldCfg.GetIDReclaimInterval() != newCfg.GetIDReclaimInterval()) {
+		oldCfg.GetIDReclaimRateLimit() != newCfg.GetIDReclaimRateLimit() {
 		return errors.New("keyspace ID reclamation settings require restarting PD")
 	}
 	if err := newCfg.Validate(); err != nil {
@@ -2271,8 +2271,7 @@ func (s *Server) loadKeyspaceConfig() {
 	// must not override the operator's current startup configuration.
 	startup := &s.cfg.Keyspace
 	cfg.EnableIDReclaim = startup.EnableIDReclaim
-	cfg.FreeIDBucketBytes = startup.FreeIDBucketBytes
-	cfg.IDReclaimInterval = startup.IDReclaimInterval
+	cfg.IDReclaimRateLimit = startup.IDReclaimRateLimit
 	s.persistOptions.SetKeyspaceConfig(cfg)
 	s.keyspaceManager.UpdateConfig(cfg)
 }
