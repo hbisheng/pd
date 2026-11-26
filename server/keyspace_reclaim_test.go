@@ -50,3 +50,36 @@ func TestKeyspaceIDReclaimRequiresStartupConfiguration(t *testing.T) {
 		require.Equal(t, 37, s.persistOptions.GetKeyspaceConfig().IDReclaimRateLimit)
 	}
 }
+
+func TestKeyspaceIDReuseRequiresStartupConfiguration(t *testing.T) {
+	cfg := config.NewConfig()
+	require.NoError(t, cfg.Adjust(nil, false))
+	old := cfg.Keyspace.Clone()
+	changed := old.Clone()
+	changed.EnableIDReuse = true
+	s := &Server{}
+	require.ErrorContains(t, s.setKeyspaceConfigInner(old, changed, false), "restarting PD")
+	active := changed.Clone()
+	changed.EnableEncryptedIDReuse = true
+	require.ErrorContains(t, s.setKeyspaceConfigInner(active, changed, false), "restarting PD")
+	s.cfg = cfg
+	s.persistOptions = config.NewPersistOptions(cfg)
+	s.keyspaceManager = keyspace.NewKeyspaceManager(context.Background(), nil, nil, nil, old, nil, nil)
+	for _, reclaim := range []bool{false, true} {
+		for _, reuse := range []bool{false, true} {
+			s.cfg.Keyspace.EnableIDReclaim = reclaim
+			s.cfg.Keyspace.EnableIDReuse = reuse
+			s.cfg.Keyspace.EnableEncryptedIDReuse = reuse
+			stale := old.Clone()
+			stale.EnableIDReclaim = !reclaim
+			stale.EnableIDReuse = !reuse
+			stale.EnableEncryptedIDReuse = !reuse
+			s.persistOptions.SetKeyspaceConfig(stale)
+			s.loadKeyspaceConfig()
+			actual := s.persistOptions.GetKeyspaceConfig()
+			require.Equal(t, reclaim, actual.EnableIDReclaim)
+			require.Equal(t, reuse, actual.EnableIDReuse)
+			require.Equal(t, reuse, actual.EnableEncryptedIDReuse)
+		}
+	}
+}

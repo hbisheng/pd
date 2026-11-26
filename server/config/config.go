@@ -924,6 +924,11 @@ type KeyspaceConfig struct {
 	// EnableIDReclaim allows external requests to reclaim deleted keyspace IDs.
 	// It does not enable reuse during Create. Changes require a PD restart.
 	EnableIDReclaim bool `toml:"enable-id-reclaim" json:"enable-id-reclaim"`
+	// EnableIDReuse lets Create claim previously reclaimed IDs. Reclamation can
+	// remain disabled while this consumes the existing pool. Requires a restart.
+	EnableIDReuse bool `toml:"enable-id-reuse" json:"enable-id-reuse"`
+	// EnableEncryptedIDReuse allows legacy-encrypted reuse when ID reuse is enabled.
+	EnableEncryptedIDReuse bool `toml:"enable-encrypted-id-reuse" json:"enable-encrypted-id-reuse"`
 	// IDReclaimRateLimit limits reclamation attempts per second, including deferred
 	// and failed requests. It must be positive when reclamation is enabled.
 	IDReclaimRateLimit int `toml:"id-reclaim-rate-limit" json:"id-reclaim-rate-limit"`
@@ -1057,3 +1062,9 @@ func (c *KeyspaceConfig) IsIDReclaimEnabled() bool {
 func (c *KeyspaceConfig) GetIDReclaimRateLimit() int {
 	return c.IDReclaimRateLimit
 }
+
+// IsIDReuseEnabled reports whether Create may consume reclaimed IDs.
+func (c *KeyspaceConfig) IsIDReuseEnabled() bool { return c.EnableIDReuse }
+
+// IsEncryptedIDReuseEnabled reports whether legacy-encrypted reuse is allowed.
+func (c *KeyspaceConfig) IsEncryptedIDReuseEnabled() bool { return c.EnableEncryptedIDReuse }

@@ -26,10 +26,13 @@ func TestKeyspaceIDReclaimConfiguration(t *testing.T) {
 	require.NoError(t, cfg.Adjust(nil, false))
 	c := cfg.Keyspace
 	require.False(t, c.IsIDReclaimEnabled())
+	require.False(t, c.IsIDReuseEnabled())
+	require.False(t, c.IsEncryptedIDReuseEnabled())
 	require.Equal(t, 100, c.GetIDReclaimRateLimit())
 	for _, limit := range []int{0, -1} {
 		copy := c.Clone()
 		copy.IDReclaimRateLimit = limit
+		copy.EnableIDReuse = true
 		require.NoError(t, copy.Validate(), "disabled reclamation must ignore its inactive settings")
 		copy.EnableIDReclaim = true
 		require.ErrorContains(t, copy.Validate(), "rate limit must be positive")

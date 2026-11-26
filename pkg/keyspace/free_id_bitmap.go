@@ -273,6 +273,21 @@ func (c *freeIDCandidates) Next() (uint32, bool) {
 	b := c.bitmap
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return c.nextLocked()
+}
+
+// tryNext lets optional reuse skip bitmap I/O already in progress. A busy
+// bitmap ends this Create's attempt; it does not change the cursor or free bits.
+func (c *freeIDCandidates) tryNext() (uint32, bool) {
+	if !c.bitmap.mu.TryLock() {
+		return 0, false
+	}
+	defer c.bitmap.mu.Unlock()
+	return c.nextLocked()
+}
+
+func (c *freeIDCandidates) nextLocked() (uint32, bool) {
+	b := c.bitmap
 	idsPerBucket := uint32(b.bucketBytes * 8)
 	resumeBucket := c.nextID / idsPerBucket
 	index, _ := slices.BinarySearch(b.freeBuckets, resumeBucket)

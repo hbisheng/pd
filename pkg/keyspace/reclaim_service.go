@@ -17,6 +17,7 @@ package keyspace
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -35,19 +36,28 @@ const (
 	freeIDLoadInterval    = 100 * time.Millisecond
 )
 
-type idReclaimConfig interface {
+type freeIDConfig interface {
+	IsIDReuseEnabled() bool
+	IsEncryptedIDReuseEnabled() bool
 	IsIDReclaimEnabled() bool
 	GetIDReclaimRateLimit() int
 }
 
 // freeIDService owns the bitmap cache and loader for one PD leadership term.
-// Reclamation fills the bitmap; Create continues using the increasing allocator.
+// Reclamation adds free IDs; Create may consume them through a separate switch.
 type freeIDService struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	done    chan struct{}
-	bitmap  *freeIDBitmap
-	limiter *rate.Limiter
+	// Only one Create selects/claims at a time. Other Creates use fresh IDs;
+	// split initialization runs after this lock is released.
+	claimMu        sync.Mutex
+	store          *freeIDLeaderStore
+	reclaimEnabled bool
+	reuseEnabled   bool
+	encrypted      bool
+	ctx            context.Context
+	cancel         context.CancelFunc
+	done           chan struct{}
+	bitmap         *freeIDBitmap
+	limiter        *rate.Limiter
 }
 
 type freeIDLeaderStore struct {
@@ -64,22 +74,22 @@ func (s *freeIDLeaderStore) RunInTxnWithConditions(ctx context.Context, conditio
 func keyspaceFreePrefix() string { return fmt.Sprintf("/pd/%d/keyspaces/free/", keypath.ClusterID()) }
 
 // StartFreeIDService starts the leader-local bitmap loader and reclamation limiter.
-// When reclamation is disabled, it returns without accessing storage or starting
-// a goroutine. Call StopFreeIDService when leadership ends.
+// With both switches off, it performs no storage IO and starts no goroutine.
+// Call StopFreeIDService when leadership ends.
 func (manager *Manager) StartFreeIDService(backend kv.Base, leaderKey, leaderValue string) error {
 	manager.freeIDLifecycleMu.Lock()
 	defer manager.freeIDLifecycleMu.Unlock()
 	manager.stopFreeIDServiceLocked()
-	cfg, ok := manager.config.(idReclaimConfig)
-	if !ok || !cfg.IsIDReclaimEnabled() {
+	cfg, ok := manager.config.(freeIDConfig)
+	if !ok || (!cfg.IsIDReclaimEnabled() && !cfg.IsIDReuseEnabled()) {
 		return nil
 	}
 	if cluster, ok := manager.cluster.(interface{ IsServiceIndependent(string) bool }); ok && cluster.IsServiceIndependent(mcsconstant.SchedulingServiceName) {
-		return errors.New("keyspace ID reclamation requires integrated scheduling")
+		return errors.New("keyspace ID reclamation/reuse requires integrated scheduling")
 	}
 	store, ok := backend.(freeIDBitmapStore)
 	if !ok || leaderKey == "" || leaderValue == "" {
-		return errors.New("keyspace ID reclamation requires revision-aware storage and a leader identity")
+		return errors.New("keyspace ID reclamation/reuse requires revision-aware storage and a leader identity")
 	}
 	guarded := &freeIDLeaderStore{freeIDBitmapStore: store, leaderKey: leaderKey, leaderValue: leaderValue}
 	// Production uses a fixed 64-byte layout; changing it requires a migration.
@@ -93,7 +103,11 @@ func (manager *Manager) StartFreeIDService(backend kv.Base, leaderKey, leaderVal
 	ctx, cancel := context.WithCancel(manager.ctx)
 	service := &freeIDService{
 		ctx: ctx, cancel: cancel, done: make(chan struct{}), bitmap: bitmap,
-		limiter: rate.NewLimiter(rate.Limit(cfg.GetIDReclaimRateLimit()), 1),
+		store: guarded, reclaimEnabled: cfg.IsIDReclaimEnabled(),
+		reuseEnabled: cfg.IsIDReuseEnabled(), encrypted: cfg.IsEncryptedIDReuseEnabled(),
+	}
+	if service.reclaimEnabled {
+		service.limiter = rate.NewLimiter(rate.Limit(cfg.GetIDReclaimRateLimit()), 1)
 	}
 	manager.freeIDs.Store(service)
 	go func() {
@@ -123,7 +137,7 @@ func (manager *Manager) stopFreeIDServiceLocked() {
 // removed and the ID is persisted as free; false means the request made no change.
 func (manager *Manager) RequestKeyspaceReclaim(ctx context.Context, id uint32) (bool, error) {
 	service := manager.freeIDs.Load()
-	if service == nil || service.ctx.Err() != nil {
+	if service == nil || !service.reclaimEnabled || service.ctx.Err() != nil {
 		return false, errors.New("keyspace ID reclamation is disabled")
 	}
 	ctx, cancel := context.WithCancel(ctx)

@@ -1263,9 +1263,12 @@ func (s *Server) UpdateKeyspaceConfig(newCfg *config.KeyspaceConfig) {
 }
 
 func (s *Server) setKeyspaceConfigInner(oldCfg, newCfg *config.KeyspaceConfig, updateKeyspaceManager bool) error {
-	if oldCfg.EnableIDReclaim != newCfg.EnableIDReclaim || newCfg.EnableIDReclaim &&
-		oldCfg.GetIDReclaimRateLimit() != newCfg.GetIDReclaimRateLimit() {
-		return errors.New("keyspace ID reclamation settings require restarting PD")
+	if oldCfg.EnableIDReclaim != newCfg.EnableIDReclaim ||
+		oldCfg.EnableIDReuse != newCfg.EnableIDReuse ||
+		oldCfg.EnableEncryptedIDReuse != newCfg.EnableEncryptedIDReuse ||
+		newCfg.EnableIDReclaim &&
+			oldCfg.GetIDReclaimRateLimit() != newCfg.GetIDReclaimRateLimit() {
+		return errors.New("keyspace ID reclamation/reuse settings require restarting PD")
 	}
 	if err := newCfg.Validate(); err != nil {
 		return err
@@ -2267,10 +2270,12 @@ func (s *Server) loadKeyspaceConfig() {
 		return
 	}
 	cfg := s.persistOptions.GetKeyspaceConfig().Clone()
-	// Reclamation is a startup-only opt-in. Persisted settings from an earlier run
-	// must not override the operator's current startup configuration.
+	// Reclamation and reuse are independent startup-only opt-ins. Persisted
+	// settings must not override the operator's current startup configuration.
 	startup := &s.cfg.Keyspace
 	cfg.EnableIDReclaim = startup.EnableIDReclaim
+	cfg.EnableIDReuse = startup.EnableIDReuse
+	cfg.EnableEncryptedIDReuse = startup.EnableEncryptedIDReuse
 	cfg.IDReclaimRateLimit = startup.IDReclaimRateLimit
 	s.persistOptions.SetKeyspaceConfig(cfg)
 	s.keyspaceManager.UpdateConfig(cfg)
