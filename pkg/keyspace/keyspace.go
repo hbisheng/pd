@@ -114,8 +114,8 @@ type Manager struct {
 	keyspaceStateLookup  sync.Map // store as ID(uint32) -> state(keyspacepb.KeyspaceState)
 	cache                *Cache
 	gcBarrierInvalidator atomic.Pointer[func(uint32)]
-	reuse                atomic.Pointer[idReuse]
-	reuseLifecycleMu     sync.Mutex
+	freeIDs              atomic.Pointer[freeIDService]
+	freeIDLifecycleMu    sync.Mutex
 }
 
 // SetGCBarrierInvalidator installs the GC observation lifecycle callback.

@@ -23,25 +23,22 @@ import (
 	"github.com/tikv/pd/pkg/utils/typeutil"
 )
 
-func TestKeyspaceIDReuseConfiguration(t *testing.T) {
+func TestKeyspaceIDReclaimConfiguration(t *testing.T) {
 	cfg := NewConfig()
 	require.NoError(t, cfg.Adjust(nil, false))
 	c := cfg.Keyspace
-	require.False(t, c.IsIDReuseEnabled())
-	require.Equal(t, uint64(1_000_000), c.GetIDReuseThreshold())
-	require.Equal(t, 64, c.GetIDReuseBucketBytes())
-	require.Equal(t, 64, c.GetIDReuseLoadPageBuckets())
-	require.Equal(t, 100*time.Millisecond, c.GetIDReuseLoadInterval())
-	require.Equal(t, 10*time.Millisecond, c.GetIDReuseReclaimInterval())
+	require.False(t, c.IsIDReclaimEnabled())
+	require.Equal(t, 64, c.GetFreeIDBucketBytes())
+	require.Equal(t, 10*time.Millisecond, c.GetIDReclaimInterval())
 	for _, update := range []func(*KeyspaceConfig){
-		func(c *KeyspaceConfig) { c.IDReuseBucketBytes = 63 },
-		func(c *KeyspaceConfig) { c.IDReuseBucketBytes = 8192 },
-		func(c *KeyspaceConfig) { c.IDReuseLoadPageBuckets = 257 },
-		func(c *KeyspaceConfig) { c.IDReuseLoadInterval = typeutil.NewDuration(-time.Second) },
-		func(c *KeyspaceConfig) { c.IDReuseReclaimInterval = typeutil.NewDuration(-time.Second) },
+		func(c *KeyspaceConfig) { c.FreeIDBucketBytes = 63 },
+		func(c *KeyspaceConfig) { c.FreeIDBucketBytes = 8192 },
+		func(c *KeyspaceConfig) { c.IDReclaimInterval = typeutil.NewDuration(-time.Second) },
 	} {
 		copy := c.Clone()
 		update(copy)
+		require.NoError(t, copy.Validate(), "disabled reclamation must ignore its inactive settings")
+		copy.EnableIDReclaim = true
 		require.Error(t, copy.Validate())
 	}
 }

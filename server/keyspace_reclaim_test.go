@@ -24,12 +24,12 @@ import (
 	"github.com/tikv/pd/server/config"
 )
 
-func TestKeyspaceIDReuseRequiresStartupConfiguration(t *testing.T) {
+func TestKeyspaceIDReclaimRequiresStartupConfiguration(t *testing.T) {
 	cfg := config.NewConfig()
 	require.NoError(t, cfg.Adjust(nil, false))
 	old := cfg.Keyspace.Clone()
 	changed := old.Clone()
-	changed.EnableIDReuse = true
+	changed.EnableIDReclaim = true
 	s := &Server{}
 	require.ErrorContains(t, s.setKeyspaceConfigInner(old, changed, false), "restarting PD")
 	// Startup configuration wins over persisted settings from the previous run.
@@ -37,11 +37,11 @@ func TestKeyspaceIDReuseRequiresStartupConfiguration(t *testing.T) {
 	s.persistOptions = config.NewPersistOptions(cfg)
 	s.keyspaceManager = keyspace.NewKeyspaceManager(context.Background(), nil, nil, nil, old, nil, nil)
 	for _, enabled := range []bool{true, false} {
-		s.cfg.Keyspace.EnableIDReuse = enabled
+		s.cfg.Keyspace.EnableIDReclaim = enabled
 		stale := old.Clone()
-		stale.EnableIDReuse = !enabled
+		stale.EnableIDReclaim = !enabled
 		s.persistOptions.SetKeyspaceConfig(stale)
 		s.loadKeyspaceConfig()
-		require.Equal(t, enabled, s.persistOptions.GetKeyspaceConfig().EnableIDReuse)
+		require.Equal(t, enabled, s.persistOptions.GetKeyspaceConfig().EnableIDReclaim)
 	}
 }

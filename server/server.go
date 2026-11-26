@@ -882,7 +882,7 @@ func (s *Server) createRaftCluster() error {
 	if err := s.cluster.Start(s, false); err != nil {
 		return err
 	}
-	if err := s.keyspaceManager.StartIDReuse(kv.NewEtcdKVBase(s.client), s.member.GetElectionPath(), s.member.MemberValue()); err != nil {
+	if err := s.keyspaceManager.StartFreeIDService(kv.NewEtcdKVBase(s.client), s.member.GetElectionPath(), s.member.MemberValue()); err != nil {
 		s.cluster.Stop()
 		return err
 	}
@@ -891,7 +891,7 @@ func (s *Server) createRaftCluster() error {
 
 func (s *Server) stopRaftCluster() {
 	if s.keyspaceManager != nil {
-		s.keyspaceManager.StopIDReuse()
+		s.keyspaceManager.StopFreeIDService()
 	}
 	failpoint.Inject("raftclusterIsBusy", func() {})
 	s.cluster.Stop()
@@ -1263,11 +1263,9 @@ func (s *Server) UpdateKeyspaceConfig(newCfg *config.KeyspaceConfig) {
 }
 
 func (s *Server) setKeyspaceConfigInner(oldCfg, newCfg *config.KeyspaceConfig, updateKeyspaceManager bool) error {
-	if oldCfg.EnableIDReuse != newCfg.EnableIDReuse ||
-		oldCfg.GetIDReuseBucketBytes() != newCfg.GetIDReuseBucketBytes() || oldCfg.GetIDReuseThreshold() != newCfg.GetIDReuseThreshold() ||
-		oldCfg.GetIDReuseLoadPageBuckets() != newCfg.GetIDReuseLoadPageBuckets() || oldCfg.GetIDReuseLoadInterval() != newCfg.GetIDReuseLoadInterval() ||
-		oldCfg.GetIDReuseReclaimInterval() != newCfg.GetIDReuseReclaimInterval() {
-		return errors.New("keyspace ID reuse settings require restarting PD")
+	if oldCfg.EnableIDReclaim != newCfg.EnableIDReclaim || newCfg.EnableIDReclaim &&
+		(oldCfg.GetFreeIDBucketBytes() != newCfg.GetFreeIDBucketBytes() || oldCfg.GetIDReclaimInterval() != newCfg.GetIDReclaimInterval()) {
+		return errors.New("keyspace ID reclamation settings require restarting PD")
 	}
 	if err := newCfg.Validate(); err != nil {
 		return err
@@ -2269,15 +2267,12 @@ func (s *Server) loadKeyspaceConfig() {
 		return
 	}
 	cfg := s.persistOptions.GetKeyspaceConfig().Clone()
-	// Reuse is a startup-only opt-in. Persisted settings from an earlier run
+	// Reclamation is a startup-only opt-in. Persisted settings from an earlier run
 	// must not override the operator's current startup configuration.
 	startup := &s.cfg.Keyspace
-	cfg.EnableIDReuse = startup.EnableIDReuse
-	cfg.IDReuseBucketBytes = startup.IDReuseBucketBytes
-	cfg.IDReuseThreshold = startup.IDReuseThreshold
-	cfg.IDReuseLoadPageBuckets = startup.IDReuseLoadPageBuckets
-	cfg.IDReuseLoadInterval = startup.IDReuseLoadInterval
-	cfg.IDReuseReclaimInterval = startup.IDReuseReclaimInterval
+	cfg.EnableIDReclaim = startup.EnableIDReclaim
+	cfg.FreeIDBucketBytes = startup.FreeIDBucketBytes
+	cfg.IDReclaimInterval = startup.IDReclaimInterval
 	s.persistOptions.SetKeyspaceConfig(cfg)
 	s.keyspaceManager.UpdateConfig(cfg)
 }
